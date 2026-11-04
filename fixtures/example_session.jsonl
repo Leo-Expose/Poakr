@@ -1,4 +1,0 @@
-{"type":"start_match","match_id":"demo","hands_total":400,"timebank_s":60}
-{"type":"decision","match_id":"demo","hand_id":"0","request_id":"0:0","hole":["Ac","Ad"],"board":[],"pot":3,"to_call":1,"my_stack":199,"opp_stack":198,"hands_left":400,"legal":[{"kind":"fold"},{"kind":"call"},{"kind":"bet","pay":4}]}
-{"type":"status","match_id":"demo","time_left_s":59}
-{"type":"end_match","match_id":"demo"}

@@ -1,490 +1,649 @@
 #!/usr/bin/env python3
-"""
-God-tier Pokerbots competitor for Discard Hold'em - FAST TOURNAMENT VERSION.
+"""Discard Hold'em protocol 1.0 bot.
 
-Integrates:
-- Vectorized 7-card evaluator + Monte Carlo equity
-- Precomputed 3-card hand equity table (22,100 hands)
-- GTO-inspired betting policy with mixed strategies
-- Optimal discard using equity + blocker analysis
-- Board texture analysis for bet sizing
-- Duplicate deal exploitation (learn from instance 1, crush instance 2)
-- Time bank management + WinLock certificate
-- Opponent modeling with adaptive frequencies
+Python 3.11; standard library and NumPy only.
+No runtime file, network, or process I/O.
 """
-import sys
-import json
-import time
-import os
+import sys, os
+sys.dont_write_bytecode = True
+for _key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ[_key] = "1"
+
+# SOURCE src/evaluator.py
 import numpy as np
 
-# Import our fast modules
-from eval7 import equity_vs_range, parse_card, card_str, preflop_equity_3card
-from discard import choose_discard, choose_discard_fast
-from policy import get_policy
+# 10 straight patterns (bool 13-vec) + their high cards. Wheel high = 3.
+_STRAIGHTS = np.zeros((10, 13), np.bool_)
+for _i, _top in enumerate(range(4, 13)):
+    _STRAIGHTS[_i, _top - 4:_top + 1] = True
+_STRAIGHTS[9, [0, 1, 2, 3, 12]] = True
+_STRAIGHT_HIGH = np.array([4, 5, 6, 7, 8, 9, 10, 11, 12, 3], np.int32)
+
+_CAT = 20
 
 
-class TimeBank:
-    """Manages cumulative time bank across hands using engine's time_left_ms."""
-    
-    def __init__(self, total_ms=60000, per_response_ms=5000):
-        self.total_ms = total_ms
-        self.remaining_ms = float(total_ms)
-        self.per_response_ms = per_response_ms
-        self.hand_count = 0
-    
-    def start_hand(self):
-        self.hand_count += 1
-    
-    def update_from_engine(self, time_left_ms):
-        """Update remaining time from engine's time_left_ms field."""
-        self.remaining_ms = float(time_left_ms)
-    
-    def get_budget(self, is_critical=False):
-        hands_left = max(1, 400 - self.hand_count)
-        reserve_per_hand = 50
-        available = max(0, self.remaining_ms - hands_left * reserve_per_hand)
-        limit = min(self.per_response_ms, available)
-        
-        if is_critical:
-            return min(limit / 1000.0, 4.5)
-        else:
-            return min(limit / 1000.0, 0.5)
-    
-    def is_critical(self, req):
-        pot = req.get('pot', 0)
-        street = req.get('street', 'preflop')
-        to_call = req.get('to_call', 0)
-        my_stack = req.get('my_stack', 200)
-        
-        if street == 'river':
-            return True
-        if pot > 100:
-            return True
-        if to_call > my_stack * 0.3:
-            return True
-        if my_stack < 50:
-            return True
-        return False
+def _top_n(mask, n):
+    """
+    mask: (N,W) bool — which columns are eligible (W = 13 for ranks, 4 for suits).
+    Returns (N,n) int32 of the n HIGHEST-index eligible columns, descending.
+    Empty slots are 0 (callers guarantee enough eligible columns).
+
+    Key trick: key = eligible*1000 + column, sort descending.  Eligible columns
+    always outrank ineligible ones, and among eligible, higher index first.
+    """
+    w = mask.shape[1]
+    key = mask.astype(np.int32) * 1000 + np.arange(w, dtype=np.int32)[None, :]
+    order = np.argsort(-key, axis=1, kind="stable")[:, :n]
+    return order.astype(np.int32)
 
 
-class GameState:
-    """Tracks game state across hands."""
-    
-    def __init__(self):
-        self.hands_played = 0
-        self.net_chips = 0
-        self.current_hand_net = 0
-        self.total_hands = 400
-        self.match_cap = 400
-        self.my_hole_cards = []
-        self.opp_discards = []
-        self.current_street = 'preflop'
-        self.action_history = []
-        self.seat = None          # 'button' or 'big_blind' from new_hand
-        self.deal_seed = None
-        self.hand_instance = 1    # 1 or 2 within duplicate pair
-        self.instance_1_my_hole = None  # Store my hole cards from instance 1
-        self.instance_1_board = None    # Store board from instance 1
-        
-        # Duplicate deal memory for exploitation (in-process, keyed by hand_id)
-        self.duplicate_memory = {}
-        
-        # Simple opponent modeling
-        self.opp_fold_freq = 0.5
-        self.opp_raise_freq = 0.1
-        self.opp_aggression = {'preflop': 0.1, 'flop': 0.2, 'turn': 0.3, 'river': 0.4}
-    
-    def reset_hand(self):
-        self.current_hand_net = 0
-        self.my_hole_cards = []
-        self.opp_discards = []
-        self.current_street = 'preflop'
-        self.action_history = []
-    
-    def is_button(self):
-        """Return True if we are the button (seat 0)."""
-        return self.seat == 'button'
-    
-    def preflop_position(self, to_call):
+def eval_batch(cards):
+    """
+    cards: (N,7) integer array of card ids (rank*4 + suit).
+    Returns (N,) int32 scores, higher is better.
+    """
+    c = np.asarray(cards)
+    if c.ndim != 2 or c.shape[1] != 7:
+        raise ValueError("cards must be (N,7)")
+    N = c.shape[0]
+    idx = np.arange(N)
+    ranks = (c // 4).astype(np.int32)
+    suits = (c % 4).astype(np.int32)
+
+    # ---- rank multiplicities (N,13) ----
+    cnt = np.zeros((N, 13), np.int8)
+    for j in range(7):
+        np.add.at(cnt, (idx, ranks[:, j]), 1)
+    present = cnt > 0
+
+    # ---- groups ----
+    is4 = cnt == 4
+    is3 = cnt == 3
+    is_ge3 = cnt >= 3
+    is2 = cnt == 2
+
+    q = np.where(is4.any(1), _top_n(is4, 1)[:, 0], -1)
+
+    t3 = np.where(is_ge3.any(1), _top_n(is_ge3, 1)[:, 0], -1)
+    # second trip (full house from two trips)
+    t3_rest = is_ge3.copy()
+    rows = idx[t3 >= 0]
+    t3_rest[rows, t3[t3 >= 0]] = False
+    t3b = np.where(t3_rest.any(1), _top_n(t3_rest, 1)[:, 0], -1)
+
+    p2 = is2.copy()
+    p2a = np.where(p2.any(1), _top_n(p2, 1)[:, 0], -1)
+    rows = idx[p2a >= 0]
+    p2[rows, p2a[p2a >= 0]] = False
+    p2b = np.where(p2.any(1), _top_n(p2, 1)[:, 0], -1)
+
+    # ---- straight ----
+    highs = np.full((N, 10), -1, np.int32)
+    for k in range(10):
+        ok = (present & _STRAIGHTS[k]).sum(1) == 5
+        highs[:, k] = np.where(ok, _STRAIGHT_HIGH[k], -1)
+    shigh = highs.max(1)
+
+    # ---- flush ----
+    suit_cnt = np.zeros((N, 4), np.int8)
+    for j in range(7):
+        np.add.at(suit_cnt, (idx, suits[:, j]), 1)
+    has_flush = (suit_cnt >= 5).any(1)
+    flush_suit = np.where(has_flush, _top_n(suit_cnt >= 5, 1)[:, 0], -1)
+
+    # ---- straight flush ----
+    sf_high = np.full(N, -1, np.int32)
+    mrows = idx[has_flush]
+    if len(mrows):
+        fs = flush_suit[mrows]
+        suit_rank = np.zeros((len(mrows), 13), np.bool_)
+        for j in range(7):
+            sel = suits[mrows, j] == fs
+            suit_rank[np.arange(len(mrows))[sel], ranks[mrows, j][sel]] = True
+        hs = np.full((len(mrows), 10), -1, np.int32)
+        for k in range(10):
+            ok = (suit_rank & _STRAIGHTS[k]).sum(1) == 5
+            hs[:, k] = np.where(ok, _STRAIGHT_HIGH[k], -1)
+        sf_high[mrows] = hs.max(1)
+    is_sf = sf_high >= 0
+
+    score = np.zeros(N, np.int64)
+
+    # --- straight flush ---
+    m = is_sf
+    score[m] = (8 << _CAT) | sf_high[m]
+
+    # --- quads ---
+    m = (score == 0) & (q >= 0)
+    if m.any():
+        excl = np.zeros((N, 13), np.bool_)
+        excl[idx[m], q[m]] = True
+        kick = _top_n(present & ~excl, 1)[idx[m], 0]
+        score[m] = (7 << _CAT) | (q[m] << 4) | kick
+
+    # --- full house ---
+    m = (score == 0) & (t3 >= 0) & ((p2a >= 0) | (t3b >= 0))
+    if m.any():
+        pair_rank = np.where(p2a >= 0, p2a, t3b)
+        score[m] = (6 << _CAT) | (t3[m] << 4) | pair_rank[m]
+
+    # --- flush ---
+    m = (score == 0) & has_flush
+    if m.any():
+        r = idx[m]
+        fs = flush_suit[m]
+        sr = np.zeros((len(r), 13), np.bool_)
+        for j in range(7):
+            sel = suits[r, j] == fs
+            sr[np.arange(len(r))[sel], ranks[r, j][sel]] = True
+        top = _top_n(sr, 5)
+        v = np.zeros(len(r), np.int64)
+        for i in range(5):
+            v |= top[:, i].astype(np.int64) << (16 - 4 * i)
+        score[m] = (5 << _CAT) | v
+
+    # --- straight ---
+    m = (score == 0) & (shigh >= 0)
+    score[m] = (4 << _CAT) | shigh[m]
+
+    # --- trips ---
+    m = (score == 0) & (t3 >= 0)
+    if m.any():
+        excl = np.zeros((N, 13), np.bool_)
+        excl[idx[m], t3[m]] = True
+        kick = _top_n(present & ~excl, 2)[idx[m]]
+        score[m] = (3 << _CAT) | (t3[m] << 8) | (kick[:, 0] << 4) | kick[:, 1]
+
+    # --- two pair ---
+    m = (score == 0) & (p2a >= 0) & (p2b >= 0)
+    if m.any():
+        hi = np.maximum(p2a[m], p2b[m])
+        lo = np.minimum(p2a[m], p2b[m])
+        excl = np.zeros((N, 13), np.bool_)
+        excl[idx[m], hi] = True
+        excl[idx[m], lo] = True
+        kick = _top_n(present & ~excl, 1)[idx[m], 0]
+        score[m] = (2 << _CAT) | (hi << 8) | (lo << 4) | kick
+
+    # --- one pair ---
+    m = (score == 0) & (p2a >= 0)
+    if m.any():
+        excl = np.zeros((N, 13), np.bool_)
+        excl[idx[m], p2a[m]] = True
+        kick = _top_n(present & ~excl, 3)[idx[m]]
+        score[m] = (1 << _CAT) | (p2a[m] << 12) | (kick[:, 0] << 8) | (kick[:, 1] << 4) | kick[:, 2]
+
+    # --- high card ---
+    m = score == 0
+    if m.any():
+        top = _top_n(present[m], 5)
+        v = np.zeros(m.sum(), np.int64)
+        for i in range(5):
+            v |= top[:, i].astype(np.int64) << (16 - 4 * i)
+        score[m] = v
+
+    return score.astype(np.int32)
+
+# SOURCE src/proofs.py
+from itertools import combinations
+
+RANKS = '23456789TJQKA'
+SUITS = 'cdhs'  # internal encoding; NOT the organizer's discard tie-break order
+DISCARD_ORDER = 'shdc'
+WINDOWS = tuple(sum(1 << (4*r+s) for r in ranks) for s in range(4)
+                for ranks in [*(tuple(range(h-4,h+1)) for h in range(4,13)),(12,0,1,2,3)])
+RANK_MASKS = tuple(15 << (4*r) for r in range(13))
+
+
+def card(text):
+    if not isinstance(text,str) or len(text)!=2 or text[0] not in RANKS or text[1] not in SUITS:
+        raise ValueError('invalid protocol card')
+    return 4*RANKS.index(text[0])+SUITS.index(text[1])
+
+
+def text_card(value):
+    return RANKS[value//4]+SUITS[value%4]
+
+
+def parse_cards(values, counts):
+    if not isinstance(values,(list,tuple)) or len(values) not in counts:
+        raise ValueError('bounded card list required')
+    out=tuple(card(c) for c in values)
+    if len(set(out))!=len(out):raise ValueError('duplicate cards')
+    return out
+
+
+def default_discard(values):
+    return min(values,key=lambda c:(RANKS.index(c[0]),DISCARD_ORDER.index(c[1])))
+
+
+def future_blinds(seat, remaining):
+    if seat not in ('button','big_blind') or type(remaining) is not int or remaining<0:
+        raise ValueError('known alternating seats and nonnegative hand count required')
+    return (remaining//2)*3+(remaining%2)*(2 if seat=='button' else 1)
+
+
+def quads_turn(hero, board, dead):
+    """Sufficient all-peer/all-river rank certificate, <=13+40 mask checks.
+
+    Higher quads need all four cards of a higher public rank. A known dead card
+    obstructs them. A straight flush window needs at most three missing cards
+    supplied by the river and two opponent cards; any blocked card obstructs it.
+    All other categories lose to our quads. No runout enumeration at runtime.
+    """
+    hero,board,dead=tuple(hero),tuple(board),tuple(dead)
+    if len(hero)!=2 or len(board)!=4 or len(dead)!=2:
+        raise ValueError('post-discard turn and both public dead cards required')
+    values=hero+board+dead
+    if any(type(c) is not int or not 0<=c<52 for c in values) or len(set(values))!=8:
+        raise ValueError('distinct normalized own/public cards required')
+    rank=hero[0]//4
+    if hero[1]//4!=rank or sum(c//4==rank for c in board)!=2:return False
+    visible=sum(1<<c for c in board)
+    blocked=sum(1<<c for c in hero+dead)
+    for higher in range(rank+1,13):
+        mask=RANK_MASKS[higher]
+        if visible & mask and not blocked & mask:return False
+    for window in WINDOWS:
+        if (window & visible).bit_count()>=2 and not (window & blocked):return False
+    return True
+
+
+def river_geometry(hero,board,dead):
+    """All physical retained pairs, including every low-probability holding.
+    Return (minimum current net, number of physical pairs), or None if beatable.
+    Dead cards constrain physical support, not a posterior selection model.
+    """
+    values=tuple(hero)+tuple(board)+tuple(dead)
+    if len(hero)!=2 or len(board)!=5 or len(dead)!=2 or len(set(values))!=9:
+        raise ValueError('complete post-discard physical state required')
+    if any(type(c) is not int or not 0<=c<52 for c in values):raise ValueError('bad card')
+    blocked=set(values)
+    peers=np.array(list(combinations((c for c in range(52) if c not in blocked),2)),dtype=np.int64)
+    boards=np.tile(board,(len(peers),1))
+    peer_scores=eval_batch(np.column_stack((peers,boards)))
+    own=int(eval_batch(np.array([tuple(hero)+tuple(board)],dtype=np.int64))[0])
+    strongest=int(peer_scores.max())
+    relation=(own>strongest)-(own<strongest)
+    q=float(np.mean((own>peer_scores)+.5*(own==peer_scores)))
+    return relation,len(peers),q
+
+
+def river_floor(hero,board,dead,opponent_paid):
+    if type(opponent_paid) is not int or not 0<=opponent_paid<=200:raise ValueError('bad paid')
+    relation,n,_=river_geometry(hero,board,dead)
+    return None if relation<0 else (opponent_paid if relation>0 else 0,n)
+
+
+def match_cap_score(results):
+    """Rulebook 8.3: sum clip(MATCH net,-C,C) / sum MATCH hand counts."""
+    from fractions import Fraction
+    numerator=denominator=0
+    for net,hands,cap in results:
+        if any(type(x) is not int for x in (net,hands,cap)) or hands<=0 or cap<=0:
+            raise ValueError('integer match net and positive hands/cap required')
+        numerator+=max(-cap,min(cap,net));denominator+=hands
+    return Fraction(numerator,denominator) if denominator else Fraction(0)
+
+# SOURCE src/protocol.py
+import json
+import random
+from dataclasses import dataclass
+
+STREETS=('preflop','flop','turn','river')
+LENGTHS=(0,3,4,5)
+
+
+def integer(value, low=0, high=10**9):
+    if type(value) is not int or not low<=value<=high:raise ValueError('integer outside range')
+    return value
+
+
+@dataclass
+class Replay:
+    paid: list
+    bets: list
+    street: int
+    actor: str
+    raises: int
+    delta: int
+    acted: list
+    closed: bool=False
+    folded: str=None
+
+    @property
+    def pot(self):return sum(self.paid)
+
+
+def replay(history,seat,target):
+    """Independently reconstruct totals from public street-total action history.
+    Blinds are implicit; amounts in history are TO amounts, not increments.
+    """
+    if seat not in ('button','big_blind') or target not in STREETS:raise ValueError('bad seat/street')
+    if not isinstance(history,list) or len(history)>64:raise ValueError('bounded public history required')
+    button=0 if seat=='button' else 1
+    r=Replay([1,2] if button==0 else [2,1],[1,2] if button==0 else [2,1],0,
+             'me' if button==0 else 'opp',1,2,[False,False])
+    def advance(s):
+        if s<r.street or (s!=r.street and not r.closed):raise ValueError('street advanced before betting closed')
+        while r.street<s:
+            r.street+=1;r.bets=[0,0];r.acted=[False,False];r.raises=0;r.delta=2
+            r.actor='me' if button==1 else 'opp'
+            r.closed=(max(r.paid)==200)
+        if s>STREETS.index(target):raise ValueError('future history')
+    for event in history:
+        if not isinstance(event,dict) or r.folded:raise ValueError('history after fold')
+        s=STREETS.index(event['street']);advance(s)
+        actor=event['actor'];p=0 if actor=='me' else 1
+        if actor not in ('me','opp') or actor!=r.actor or r.closed:raise ValueError('wrong history actor')
+        kind=event['action'];owed=max(0,r.bets[1-p]-r.bets[p]);paid=0
+        if kind=='fold':
+            if owed==0:raise ValueError('free fold is illegal')
+            r.folded=actor;r.closed=True
+        elif kind=='check':
+            if owed:raise ValueError('check facing a bet')
+            r.acted[p]=True
+        elif kind=='call':
+            amount=integer(event['amount'],0,200)
+            if owed<=0 or amount!=r.bets[1-p]:raise ValueError('call must be exact street TO amount')
+            paid=amount-r.bets[p];r.bets[p]=amount;r.acted[p]=True
+        elif kind=='raise':
+            amount=integer(event['amount'],0,200)
+            maximum=min(r.bets[p]+200-r.paid[p],r.bets[1-p]+200-r.paid[1-p])
+            minimum=min(maximum,r.bets[1-p]+max(2,r.delta))
+            if r.raises>=4 or max(r.paid)==200 or not minimum<=amount<=maximum or amount<=r.bets[1-p]:
+                raise ValueError('illegal raise in history')
+            r.delta=amount-r.bets[1-p];paid=amount-r.bets[p];r.bets[p]=amount
+            r.raises+=1;r.acted=[False,False];r.acted[p]=True
+        else:raise ValueError('unknown history action')
+        r.paid[p]+=paid
+        if max(r.paid)>200:raise ValueError('stack exceeded')
+        if r.bets[0]==r.bets[1] and all(r.acted):r.closed=True
+        r.actor='opp' if actor=='me' else 'me'
+    advance(STREETS.index(target))
+    return r
+
+
+class DiscardBot:
+    def __init__(self,samples=128,spend_to_cap=True):
+        self.samples=integer(samples,1,4096)
+        self.spend_to_cap=spend_to_cap
+        self.rng=random.Random(734)
+        self.ready=False;self.finished=False;self.score=0;self.score_trusted=True
+        self.completed=0;self.errors=0;self.proof_arms=0;self.lock_actions=0
+        self.hand_id=None;self.pending=False;self.locked=False
+        self.certificate=None;self.cache={};self.last_history=[]
+        self.own=();self.original=();self.dead=();self.board=()
+        self.chosen_discard=None;self.last_result=None;self.geometry=None;self.expected_reply=None;self.reserve=None
+
+    def _money(self,msg):
+        a=integer(msg['my_stack'],0,200);b=integer(msg['opp_stack'],0,200)
+        pot=integer(msg['pot'],0,400)
+        if pot!=400-a-b:raise ValueError('nonconserving pot/stacks')
+        return 200-a,200-b
+
+    def _board(self,msg,counts):
+        board=parse_cards(msg['board'],counts)
+        if board[:len(self.board)]!=self.board or set(board)&(set(self.original)|set(self.dead)):
+            raise ValueError('changed/colliding public board')
+        self.board=board
+        return board
+
+    def _same_hand(self,msg):
+        if integer(msg['hand_id'],1,self.total)!=self.hand_id:raise ValueError('wrong hand')
+
+    def _remaining_cost(self):
+        return future_blinds(self.seat,self.total-self.hand_id)
+
+    def _equity(self,board):
+        """Coupled-scenario fixed discard choices; never max-own per runout.
+        Pre-discard peer max over pairs is a pessimistic clairvoyant envelope,
+        not a simulated legal opponent. Actual strategy uses uniform deal models.
+        Post-discard uniform retained-pair estimates omit discard-selection bias.
         """
-        Determine preflop position from engine's perspective.
-        Button posts 1, BB posts 2. Button acts first preflop with to_call=1.
-        """
-        if self.is_button():
-            return 'button'  # Acts first, to_call=1
-        else:
-            return 'big_blind'  # Acts second, to_call=2 or 0 if button checked
-    
-    def winlock_check(self):
-        remaining = self.total_hands - self.hands_played
-        if remaining <= 0:
-            return True
-        max_future_loss = remaining * 50
-        current_risk = abs(self.current_hand_net)
-        if self.net_chips - current_risk > max_future_loss + 10:
-            return True
-        return False
-    
-    def update_opp_model_from_history(self, req):
-        """Update opponent model from req['history'] only (opponent actions)."""
-        for event in req.get('history', []):
-            if event.get('actor') == 'opp':
-                street = event['street']
-                action = event['action']
-                bet_size = event.get('amount', 0)
-                pot = req.get('pot', 0)
-                to_call = req.get('to_call', 0)
-                
-                if action == 'fold':
-                    self.opp_fold_freq = 0.9 * self.opp_fold_freq + 0.1
-                elif action == 'raise':
-                    self.opp_raise_freq = 0.9 * self.opp_raise_freq + 0.1
-                    self.opp_aggression[street] = 0.9 * self.opp_aggression.get(street, 0.2) + 0.1
-                elif action == 'call':
-                    self.opp_aggression[street] = 0.9 * self.opp_aggression.get(street, 0.2) + 0.05
-    
-    def opp_fold_estimate(self, street, bet_size, pot):
-        base = self.opp_fold_freq
-        agg = self.opp_aggression.get(street, 0.2)
-        bet_frac = bet_size / (pot + bet_size) if pot > 0 else 0.5
-        return np.clip(base * (1 + bet_frac) * (1 - agg * 0.5), 0.05, 0.95)
-    
-    def opp_call_threshold(self, street):
-        agg = self.opp_aggression.get(street, 0.2)
-        return 0.35 - agg * 0.15
-    
-    def store_instance_1_data(self, my_hole, board):
-        """Store data from instance 1 for exploitation in instance 2."""
-        self.instance_1_my_hole = my_hole
-        self.instance_1_board = board
-    
-    def get_instance_2_exploit_info(self):
-        """
-        For instance 2: opponent holds exactly my instance 1 hole cards.
-        Board from instance 1 is known if it reached that street.
-        """
-        if self.hand_instance != 2 or self.instance_1_my_hole is None:
+        key=(self.own,board,self.dead)
+        if key in self.cache:return self.cache[key]
+        if len(board)==5 and self.geometry is not None:return self.geometry[2],self.own
+        n=self.samples
+        own_pairs=list(combinations(self.own,2))
+        blocked=set(self.original)|set(board)|set(self.dead)
+        deck=[c for c in range(52) if c not in blocked]
+        pre=len(self.own)==3
+        peer_count=3 if pre else 2
+        need=5-len(board)
+        worlds=np.array([self.rng.sample(deck,peer_count+need) for _ in range(n)],dtype=np.int64)
+        boards=np.column_stack((np.tile(board,(n,1)),worlds[:,peer_count:]))
+        peer_options=list(combinations(range(peer_count),2))
+        peer=np.stack([worlds[:,ix] for ix in peer_options])
+        peer_full=np.concatenate((peer,np.broadcast_to(boards,(len(peer_options),n,5))),axis=2)
+        strongest=eval_batch(peer_full.reshape(-1,7)).reshape(len(peer_options),n).max(axis=0)
+        own_full=np.stack([np.column_stack((np.tile(pair,(n,1)),boards)) for pair in own_pairs])
+        scores=eval_batch(own_full.reshape(-1,7)).reshape(len(own_pairs),n)
+        estimates=((scores>strongest)+.5*(scores==strongest)).mean(axis=1)
+        best=int(np.argmax(estimates))
+        result=(float(estimates[best]),own_pairs[best])
+        # Per-hand cache: <= five board states; reset at the next hand.
+        if len(self.cache)<12:self.cache[key]=result
+        return result
+
+    def _safe_action(self,msg):
+        legal=msg.get('legal_actions',[])
+        if 'check' in legal:return dict(type='action',action='check')
+        if self.pending and 'call' in legal:return dict(type='action',action='call')
+        if 'fold' in legal:return dict(type='action',action='fold')
+        if 'call' in legal:return dict(type='action',action='call')
+        # Valid protocol requests always supply a passive action.
+        raise ValueError('no safe legal action')
+
+    def _arm(self,paid,board,allow_river=True):
+        if not self.score_trusted:return
+        future=self._remaining_cost()
+        if self.locked:
+            if self.score-paid[0]-future<self.reserve:
+                self.score_trusted=False;self.locked=False;self.certificate=None
+            elif self.certificate is not None:
+                lower=self.score-paid[0]-future
+                self.certificate.update(abandonment_lower=lower,lower=self.reserve)
+            return
+        if self.pending:return
+        lower=self.score-paid[0]-future
+        if lower>0:
+            self.reserve=min(lower,self.match_cap) if self.spend_to_cap else lower
+            self.locked=True;self.certificate=dict(kind='margin-budget' if self.spend_to_cap else 'abandon',abandonment_lower=lower,lower=self.reserve);self.proof_arms+=1;return
+        if len(self.own)!=2 or len(self.dead)!=2:return
+        floor=None;kind=None;peers=None
+        if len(board)==4 and quads_turn(self.own,board,self.dead):floor=paid[1];kind='dead-card-turn'
+        elif len(board)==5 and allow_river:
+            if self.geometry is None:self.geometry=river_geometry(self.own,board,self.dead)
+            relation,peers,_=self.geometry
+            if relation>=0:floor=paid[1] if relation>0 else 0;kind='all-physical-river'
+        if floor is not None and self.score+floor-future>0:
+            self.pending=True;self.floor=floor;self.anchor=board
+            lower=self.score+floor-future
+            self.reserve=min(lower,self.match_cap) if self.spend_to_cap else lower
+            self.certificate=dict(kind=kind,abandonment_lower=lower,lower=self.reserve,peers=peers)
+            self.proof_arms+=1
+
+    def _verify_history(self,history):
+        if not isinstance(history,list):raise ValueError('history missing')
+        if self.last_history and history[:len(self.last_history)]!=self.last_history:
+            raise ValueError('changed accepted history')
+        if self.expected_reply is not None:
+            index,event,_=self.expected_reply
+            if len(history)<=index or any(history[index].get(k)!=v for k,v in event.items()):
+                raise ValueError('submitted own response absent or changed without correction notice')
+            self.expected_reply=None
+
+    def handle(self,msg):
+        reply=self._handle(msg)
+        if reply is not None and msg.get('type')=='action_request':
+            event=dict(street=msg['street'],actor='me',action=reply['action'])
+            delta=0
+            if reply['action']=='raise':event['amount']=reply['amount'];delta=reply['amount']-msg['my_bet']
+            elif reply['action']=='call':event['amount']=msg['opp_bet'];delta=msg['to_call']
+            self.expected_reply=(len(msg['history']),event,200-msg['my_stack']+delta)
+        return reply
+
+    def _handle(self,msg):
+        if not isinstance(msg,dict):return None
+        kind=msg.get('type')
+        if kind=='init':
+            if self.ready:raise ValueError('repeated init')
+            if msg['protocol_version']!='1.0' or (msg['starting_stack'],msg['small_blind'],msg['big_blind'])!=(200,1,2):
+                raise ValueError('unsupported protocol/rules')
+            self.total=integer(msg['total_hands'],1,10000)
+            self.match_cap=400 if self.total<=400 else 1000
+            self.bank=integer(msg['time_bank_ms'],1)
+            self.per_reply=integer(msg['per_response_ms'],1)
+            self.ready=True;return None
+        if kind=='match_end':self.finished=True;return None
+        # Unknown future types/fields are ignored, as required by the protocol.
+        if kind not in ('new_hand','action_request','discard_request','discard_result','hand_result','notice'):return None
+        if not self.ready:raise ValueError('init required')
+        if kind=='new_hand':
+            if self.hand_id is not None:raise ValueError('unfinished previous hand')
+            h=integer(msg['hand_id'],1,self.total)
+            if h!=self.completed+1:raise ValueError('nonsequential hand')
+            seat=msg['seat']
+            if seat not in ('button','big_blind') or (msg['stack'],msg['opp_stack'])!=(200,200):raise ValueError('unsupported hand')
+            if hasattr(self,'last_seat') and seat==self.last_seat:raise ValueError('seats did not alternate')
+            self.hand_id=h;self.seat=seat;self.last_seat=seat
+            self.original=parse_cards(msg['hole_cards'],(3,));self.own=self.original
+            self.dead=();self.board=();self.cache={};self.chosen_discard=None;self.last_history=[];self.geometry=None;self.expected_reply=None
             return None
-        
-        # Opponent's hole cards = my instance 1 hole cards
-        opp_hole = self.instance_1_my_hole
-        
-        # Board known up to where instance 1 reached
-        known_board = self.instance_1_board if self.instance_1_board else []
-        
-        return {
-            'opp_hole': opp_hole,
-            'known_board': known_board,
-            'perfect_info': True
-        }
-
-
-# Global state
-_timebank = None
-_gamestate = None
-_policy = None
-
-
-def init_globals(total_hands=400, time_bank_ms=60000, per_response_ms=5000):
-    global _timebank, _gamestate, _policy
-    _timebank = TimeBank(time_bank_ms, per_response_ms)
-    _gamestate = GameState()
-    _gamestate.total_hands = total_hands
-    _gamestate.match_cap = 400 if total_hands <= 400 else 1000
-    _policy = get_policy(seed=42)
-
-
-def choose_action(req):
-    """Handle action_request with GTO + duplicate exploitation."""
-    global _timebank, _gamestate, _policy
-    
-    # Wrap in try/except to prevent crashes from causing forfeits
-    try:
-        return _choose_action_impl(req)
-    except Exception as e:
-        # Log to stderr (not stdout!)
-        import sys
-        sys.stderr.write(f"choose_action error: {e}\n")
-        # Return safe action
-        legal = req.get('legal_actions', ['fold'])
-        if 'check' in legal:
-            return {'type': 'action', 'action': 'check'}
-        elif 'call' in legal:
-            return {'type': 'action', 'action': 'call'}
-        else:
-            return {'type': 'action', 'action': 'fold'}
-
-def _choose_action_impl(req):
-    """Implementation of action handling."""
-    global _timebank, _gamestate, _policy
-    
-    # Update time bank from engine's time_left_ms
-    if _timebank and 'time_left_ms' in req:
-        _timebank.update_from_engine(req['time_left_ms'])
-    
-    is_critical = _timebank.is_critical(req) if _timebank else True
-    budget = _timebank.get_budget(is_critical) if _timebank else 0.5
-    start = time.perf_counter()
-    
-    legal = req['legal_actions']
-    street = req['street']
-    board = req['board']
-    pot = req['pot']
-    to_call = req['to_call']
-    my_stack = req['my_stack']
-    opp_stack = req['opp_stack']
-    raises_left = req.get('raises_left', 4)
-    
-    _gamestate.current_street = street
-    
-    # Update opponent model from history (only opponent actions)
-    _gamestate.update_opp_model_from_history(req)
-    
-    # Build request with tracked hole cards
-    req_with_hole = dict(req)
-    req_with_hole['hole_cards'] = _gamestate.my_hole_cards
-    
-    # --- DUPLICATE DEAL EXPLOITATION (Corrected) ---
-    # In instance 2, opponent holds exactly my instance 1 hole cards
-    exploit_info = _gamestate.get_instance_2_exploit_info()
-    
-    if exploit_info and exploit_info.get('perfect_info'):
-        # WE KNOW THEIR EXACT HAND (my instance 1 cards) - play perfectly
-        opp_hole = exploit_info['opp_hole']
-        known_board = exploit_info['known_board']
-        
-        # Compute exact equity vs known hand
-        my_hole_ids = [parse_card(c) for c in _gamestate.my_hole_cards]
-        opp_hole_ids = [parse_card(c) for c in opp_hole]
-        board_ids = [parse_card(c) for c in board]
-        
-        # Safety: ensure we have exactly 2 cards postflop
-        if len(my_hole_ids) != 2 and street != 'preflop':
-            # Fallback to normal policy if hole cards not properly set
-            action = _policy.choose_action(req_with_hole)
-        else:
-            # Use preflop_equity_3card for preflop, else head-to-head
-            if street == 'preflop':
-                # We have 3 cards, preflop_equity_3card computes best 2-card equity
-                eq = preflop_equity_3card(my_hole_ids, n_draws=500)
+        if kind=='notice':
+            # The next full history / discard_result is authoritative. Do not
+            # book the submitted action as accepted, nor guess its correction.
+            self.score_trusted=False;self.locked=False;self.certificate=None;self.expected_reply=None
+            return None
+        self._same_hand(msg)
+        if kind=='discard_result':
+            own_discard=card(msg['my_discard']);opp_discard=card(msg['opp_discard'])
+            own=parse_cards(msg['hole_cards'],(2,))
+            if own_discard not in self.original or set(own)!=(set(self.original)-{own_discard}):raise ValueError('discard mismatch')
+            if opp_discard in set(self.original)|set(self.board):raise ValueError('colliding opposing discard')
+            if len(self.dead) and self.dead!=(own_discard,opp_discard):raise ValueError('changed public discard')
+            self.own=own;self.dead=(own_discard,opp_discard);self.cache={}
+            return None
+        if kind=='hand_result':
+            board=self._board(msg,(0,3,4,5))
+            own=parse_cards(msg['my_hole_cards'],(2,3))
+            if set(own)!=set(self.own):raise ValueError('result changed own cards')
+            target=STREETS[LENGTHS.index(len(board))]
+            self._verify_history(msg['history'])
+            r=replay(msg['history'],self.seat,target)
+            if msg['result']=='fold':
+                if r.folded not in ('me','opp'):raise ValueError('fold result without folded actor')
+                expected=-r.paid[0] if r.folded=='me' else r.paid[1]
+            elif msg['result']=='showdown':
+                if len(board)!=5 or len(self.dead)!=2 or r.folded or not r.closed or r.paid[0]!=r.paid[1]:raise ValueError('incomplete showdown')
+                peer=parse_cards(msg['opp_hole_cards'],(2,))
+                if set(peer)&(set(self.original)|set(board)|set(self.dead)):raise ValueError('colliding revealed peer')
+                scores=eval_batch(np.array([self.own+board,peer+board],dtype=np.int64))
+                expected=(int(scores[0]>scores[1])-int(scores[0]<scores[1]))*r.paid[0]
+            else:raise ValueError('unknown result')
+            if (msg.get('opp_discard') is not None) != bool(self.dead) or (self.dead and card(msg['opp_discard'])!=self.dead[1]):
+                raise ValueError('result changed the exposed discard')
+            net=integer(msg['net'],-200,200)
+            if net!=expected:raise ValueError('net disagrees with public ledger / showdown')
+            if self.pending and (net<self.floor or (msg['result']=='fold' and r.folded=='me')):
+                self.score_trusted=False;self.certificate=None
+            self.score+=net;self.completed+=1
+            if self.pending and self.score_trusted:self.locked=True
+            self.pending=False;self.last_result=self.hand_id;self.hand_id=None
+            return None
+        left=integer(msg['time_left_ms'],0)
+        if kind=='discard_request':
+            incoming=parse_cards(msg['hole_cards'],(3,))
+            if set(incoming)!=set(self.original) or len(self.own)!=3:raise ValueError('wrong discard holding')
+            board=self._board(msg,(3,));paid=self._money(msg)
+            if paid[0]!=paid[1]:raise ValueError('discard before matching flop wagers')
+            if self.expected_reply is not None and paid[0]!=self.expected_reply[2]:
+                raise ValueError('submitted action not reflected in discard stacks')
+            cap_sealed=self.locked and self.score-paid[0]-self._remaining_cost()>=self.match_cap
+            if (self.locked and not self.spend_to_cap) or cap_sealed or left<100 or self.per_reply<100:
+                discarded=default_discard(msg['hole_cards'])
             else:
-                # For postflop, use Monte Carlo with known opponent hand
-                from eval7 import equity_vs_range
-                eq = equity_vs_range(my_hole_ids, board_ids, n_draws=1000, 
-                                   seed=hash(tuple(sorted(my_hole_ids + opp_hole_ids))) & 0xFFFFFFFF)
-            
-            action = _perfect_decision(eq, legal, pot, to_call, my_stack, opp_stack, req)
-    else:
-        # Normal GTO policy
-        action = _policy.choose_action(req_with_hole)
-    
-    # WinLock safety
-    if _gamestate.winlock_check():
-        if action['action'] in ('call', 'raise'):
-            if 'check' in legal:
-                action = {'type': 'action', 'action': 'check'}
-            else:
-                action = {'type': 'action', 'action': 'fold'}
-    
-    # Ensure legal
-    if action['action'] not in legal:
-        if 'check' in legal:
-            action = {'type': 'action', 'action': 'check'}
-        elif 'call' in legal:
-            action = {'type': 'action', 'action': 'call'}
-        else:
-            action = {'type': 'action', 'action': 'fold'}
-    
-    # Track time (already updated from engine)
-    elapsed = time.perf_counter() - start
-    if _timebank:
-        _timebank.remaining_ms -= elapsed * 1000
-    
-    return action
+                _,keep=self._equity(board)
+                discarded=text_card(next(c for c in self.original if c not in keep))
+            self.chosen_discard=discarded
+            return dict(type='discard',card=discarded)
+        street=msg['street'];board=self._board(msg,(LENGTHS[STREETS.index(street)],))
+        paid=self._money(msg);self._verify_history(msg['history']);r=replay(msg['history'],self.seat,street)
+        my_bet=integer(msg['my_bet'],0,200);opp_bet=integer(msg['opp_bet'],0,200)
+        if (r.paid!=list(paid) or r.bets!=[my_bet,opp_bet] or r.actor!='me' or r.closed):
+            raise ValueError('request differs from accepted-action history')
+        if self.last_history and msg['history'][:len(self.last_history)]!=self.last_history:raise ValueError('changed accepted history')
+        self.last_history=list(msg['history'])
+        owed=integer(msg['to_call'],0,200)
+        if owed!=max(0,r.bets[1]-r.bets[0]):raise ValueError('wrong call price')
+        if len(board)>=4 and (len(self.own)!=2 or len(self.dead)!=2):raise ValueError('post-discard information missing')
+        legal=msg['legal_actions']
+        if not isinstance(legal,list) or not legal or len(legal)>4 or len(set(legal))!=len(legal) or not set(legal)<={'fold','check','call','raise'}:
+            raise ValueError('unknown legal action')
+        passive={'check'} if owed==0 else {'fold','call'}
+        if set(legal)-{'raise'}!=passive:raise ValueError('missing passive action')
+        if integer(msg['raises_left'],0,4)!=4-r.raises:raise ValueError('raise count mismatch')
+        if 'raise' in legal:
+            maximum=min(r.bets[0]+200-paid[0],r.bets[1]+200-paid[1])
+            minimum=min(maximum,r.bets[1]+max(2,r.delta))
+            if (integer(msg['min_raise'],1,200),integer(msg['max_raise'],1,200))!=(minimum,maximum) or r.raises>=4 or max(paid)==200:
+                raise ValueError('raise range mismatch')
+        self._arm(paid,board,allow_river=left>100 and self.per_reply>=100)
+        if self.pending:
+            if board[:len(self.anchor)]!=self.anchor:raise ValueError('stale settlement proof')
+            required='call' if owed else 'check'
+            if required not in legal:raise ValueError('safe continuation unavailable')
+            return dict(type='action',action=required)
+        if self.locked:
+            self.lock_actions+=1
+            if not self.spend_to_cap or self.score-paid[0]-self._remaining_cost()>=self.match_cap:
+                return self._safe_action(msg)
+        budget=200 if not self.locked else min(200,self.score-self._remaining_cost()-self.reserve)
+        if self.locked and budget<=paid[0]:return self._safe_action(msg)
+        if owed and paid[0]+owed>budget:return dict(type='action',action='fold')
+        if left<100 or self.per_reply<100:return self._safe_action(msg)
+        q,_=self._equity(board)
+        pot=msg['pot'];price=owed/(pot+owed) if owed else 0
+        if owed and q<price+.025:return dict(type='action',action='fold')
+        budget_max=msg.get('max_raise',0) if not self.locked else min(msg.get('max_raise',0),my_bet+budget-paid[0])
+        if 'raise' in legal and budget_max>=msg['min_raise'] and q>(.72 if len(board)<4 else .76):
+            minimum=msg['min_raise'];maximum=budget_max
+            amount=max(minimum,min(maximum,msg['opp_bet']+max(2,int(.65*(pot+owed)))))
+            return dict(type='action',action='raise',amount=amount)
+        return dict(type='action',action='call' if owed else 'check')
 
-
-def _perfect_decision(eq, legal, pot, to_call, my_stack, opp_stack, req):
-    """Perfect decision when we know opponent's exact hand."""
-    if to_call == 0:
-        if eq > 0.6:
-            if 'raise' in legal:
-                min_raise = req.get('min_raise', pot)
-                max_raise = req.get('max_raise', my_stack)
-                size = min(max_raise, max(min_raise, int(pot * (0.5 if eq < 0.75 else 0.75))))
-                return {'type': 'action', 'action': 'raise', 'amount': size}
-        elif eq < 0.35 and pot > 15 and 'raise' in legal:
-            min_raise = req.get('min_raise', pot)
-            max_raise = req.get('max_raise', my_stack)
-            size = min(max_raise, max(min_raise, int(pot * 0.66)))
-            return {'type': 'action', 'action': 'raise', 'amount': size}
-        return {'type': 'action', 'action': 'check'}
-    else:
-        pot_odds = to_call / (pot + to_call)
-        if eq > pot_odds + 0.08:
-            if eq > 0.75 and 'raise' in legal:
-                min_raise = req.get('min_raise', pot + to_call)
-                max_raise = req.get('max_raise', my_stack)
-                size = min(max_raise, max(min_raise, int((pot + to_call) * 2.5)))
-                return {'type': 'action', 'action': 'raise', 'amount': size}
-            return {'type': 'action', 'action': 'call'}
-        elif eq > pot_odds - 0.05:
-            return {'type': 'action', 'action': 'call'}
-        else:
-            return {'type': 'action', 'action': 'fold'}
-
-
-def _choose_discard_impl(req):
-    """Implementation of discard handling."""
-    global _timebank, _gamestate, _policy
-    
-    budget = _timebank.get_budget(is_critical=True) if _timebank else 1.0
-    start = time.perf_counter()
-    
-    hole = req['hole_cards']
-    board = req['board']
-    pot = req['pot']
-    my_stack = req['my_stack']
-    opp_stack = req['opp_stack']
-    
-    _gamestate.my_hole_cards = hole
-    
-    # Normal GTO discard (fast)
-    if pot > 50:
-        discard_card = _policy.choose_discard(hole, board, pot, my_stack, opp_stack)
-    else:
-        from discard import choose_discard_fast
-        discard_card = choose_discard_fast(hole, board)
-    
-    _gamestate.pending_discard = discard_card
-    _gamestate.opp_discards.append(discard_card)
-    
-    elapsed = time.perf_counter() - start
-    if _timebank:
-        _timebank.remaining_ms -= elapsed * 1000
-    
-    return {'type': 'discard', 'card': discard_card}
-
-def choose_discard(req):
-    """Handle discard_request with GTO + duplicate exploitation."""
-    global _timebank, _gamestate, _policy
-    
-    try:
-        return _choose_discard_impl(req)
-    except Exception as e:
-        import sys
-        sys.stderr.write(f"choose_discard error: {e}\n")
-        # Safe fallback
-        hole = req.get('hole_cards', [])
-        if hole:
-            from discard import default_discard
-            try:
-                return {'type': 'discard', 'card': default_discard(hole)}
-            except:
-                pass
-        return {'type': 'discard', 'card': hole[0] if hole else '2c'}
-
-
-def handle_message(msg):
-    """Route message to appropriate handler."""
-    global _timebank, _gamestate, _policy
-    
-    try:
-        return _handle_message_impl(msg)
-    except Exception as e:
-        import sys
-        sys.stderr.write(f"handle_message error: {e}\n")
+    def fallback(self,msg):
+        self.errors+=1
+        self.score_trusted=False;self.locked=False;self.certificate=None
+        if not isinstance(msg,dict):return None
+        if msg.get('type')=='discard_request':
+            values=msg.get('hole_cards',[])
+            if len(values)==3:
+                try:return dict(type='discard',card=default_discard(values))
+                except (ValueError,IndexError,TypeError):pass
+        if msg.get('type')=='action_request':
+            try:return self._safe_action(msg)
+            except (ValueError,TypeError):return None
+        if msg.get('type')=='hand_result':
+            # Continue legal gameplay if reconciliation failed, but never claim
+            # a certified lead from an unverified result.
+            if self.hand_id==msg.get('hand_id'):
+                self.completed+=1;self.hand_id=None;self.pending=False
         return None
 
-def _handle_message_impl(msg):
-    """Implementation of message handling."""
-    global _timebank, _gamestate, _policy
-    
-    msg_type = msg.get('type')
-    
-    if msg_type == 'init':
-        total_hands = msg.get('total_hands', 400)
-        time_bank_ms = msg.get('time_bank_ms', 60000)
-        per_response_ms = msg.get('per_response_ms', 5000)
-        init_globals(total_hands, time_bank_ms, per_response_ms)
-        return None
-    
-    elif msg_type == 'new_hand':
-        _gamestate.hands_played += 1
-        _gamestate.reset_hand()
-        _gamestate.seat = msg.get('seat', 'button')
-        _gamestate.my_hole_cards = msg.get('hole_cards', [])
-        _gamestate.deal_seed = msg.get('deal_seed', str(_gamestate.hands_played))
-        _gamestate.hand_instance = 1 if (_gamestate.hands_played % 2 == 1) else 2
-        
-        # Store instance 1 data for instance 2 exploitation
-        if _gamestate.hand_instance == 1:
-            _gamestate.instance_1_my_hole = list(_gamestate.my_hole_cards)
-            _gamestate.instance_1_board = []
-        
-        _timebank.start_hand()
-        return None
-    
-    elif msg_type == 'action_request':
-        return choose_action(msg)
-    
-    elif msg_type == 'discard_request':
-        return choose_discard(msg)
-    
-    elif msg_type == 'discard_result':
-        my_discard = msg.get('my_discard')
-        opp_discard = msg.get('opp_discard')
-        hole_cards = msg.get('hole_cards', [])
-        
-        _gamestate.my_hole_cards = hole_cards
-        _gamestate.opp_discards.append(opp_discard)
-        _gamestate.pending_discard = None
-        
-        # Update instance 1 board knowledge
-        if _gamestate.hand_instance == 1 and _gamestate.instance_1_board is not None:
-            _gamestate.instance_1_board = list(msg.get('board', []))
-        
-        return None
-    
-    elif msg_type == 'hand_result':
-        net = msg.get('net', 0)
-        _gamestate.net_chips += net
-        _gamestate.current_hand_net = net
-        _gamestate.hands_played = msg.get('hand_id', _gamestate.hands_played)
-        
-        # Update instance 1 board if showdown
-        if _gamestate.hand_instance == 1 and msg.get('result') == 'showdown':
-            _gamestate.instance_1_board = list(msg.get('board', []))
-        
-        # Time bank uses engine's time_left_ms, no end_hand needed
-        return None
-    
-    elif msg_type == 'notice':
-        return None
-    
-    elif msg_type == 'match_end':
-        return None
-    
-    return None
 
-
-def main():
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
+def discard_main():
+    bot=DiscardBot()
+    for line in __import__('sys').stdin:
         try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        
-        reply = handle_message(msg)
-        if reply is not None:
-            print(json.dumps(reply, separators=(',', ':')), flush=True)
-        
-        if msg.get('type') == 'match_end':
-            break
-
+            msg=json.loads(line)
+        except (ValueError,TypeError):continue
+        try:reply=bot.handle(msg)
+        except (ValueError,KeyError,TypeError,IndexError,OverflowError):reply=bot.fallback(msg)
+        if reply is not None:print(json.dumps(reply,separators=(',',':')),flush=True)
+        if bot.finished:break
+    return bot
 
 if __name__ == '__main__':
-    main()
+    discard_main()

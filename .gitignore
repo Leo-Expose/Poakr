@@ -1,89 +1,10 @@
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-env/
+*.pyo
+.pytest_cache/
+.venv/
 venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Project logs
+env/
+submission.zip
 logs/
 *.log
-
-# Data files (preflop equity JSONs are large)
-preflop_*.json
-*.preflop.json
-*.equity.json
-*.cfr_preflop.json
-
-# Evidence and research generated files (large archives)
-evidence/
-
-# Compiled and built directories
-*.egg-info/
-build/
-dist/
-develop-eggs/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg
-MANIFEST
-
-# IDE and editor files
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Environment files
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-.env.dev
-
-# Python coverage
-.coverage
-.coverage.*
-htmlcov/
-.tox/
-.nox/
-.pytest_cache/
-coverage.xml
-*.cover
-*.py,cover
-
-# Testing and CI
-.pytest_cache/
-.tox/
-maven-target/
-
-# OS-specific files
-Thumbs.db
-.DS_Store
-
-# Project-specific cache
-logs/
-data/legacy_preflop/
-data/preflop/
-
-# Large generated files
-*.parquet
-*.feather
-*.hdf5
-
-# Jupyter notebook checkpoints
-.ipynb_checkpoints/

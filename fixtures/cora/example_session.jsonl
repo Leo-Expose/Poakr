@@ -1,4 +1,0 @@
-{"type":"start_match","match_id":"demo","starting_stack":200,"sb":1,"bb":2,"hands_total":400,"timebank_s":60,"raw_net_abandonment_contract":true}
-{"type":"decision","match_id":"demo","request_id":"r0","hand_id":"h0","hole":["Ac","Ad"],"board":[],"pot":3,"to_call":1,"my_stack":199,"opp_stack":198,"hands_left":400,"banked_net":0,"seat":0,"history":[],"legal":[{"kind":"fold"},{"kind":"call"},{"kind":"bet","pay":4}]}
-{"type":"status","match_id":"demo","time_left_s":59}
-{"type":"end_match","match_id":"demo"}
