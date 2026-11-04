@@ -1,0 +1,13 @@
+{
+  "review_date": "2026-11-02",
+  "scope": "User-requested OpenSpiel investigation; documentation and framework paper excerpts only. No competitor bot source copied, no package installed.",
+  "version_status": "Documentation latest, not a locally installed or pinned OpenSpiel release.",
+  "sources": [
+    {"url": "https://openspiel.readthedocs.io/en/latest/algorithms.html", "finding": "CFR, CFR-BR, exploitability/best response, MCCFR, sequence-form LP; statuses vary."},
+    {"url": "https://openspiel.readthedocs.io/en/latest/games.html", "finding": "Kuhn, Leduc, ACPC-backed Holdem listed. No reviewed ready-made game establishes exact target discard/match semantics."},
+    {"url": "https://openspiel.readthedocs.io/en/latest/concepts.html", "finding": "Game/State, chance, sequential conversion of simultaneous games."},
+    {"url": "https://openspiel.readthedocs.io/en/latest/developer_guide.html", "finding": "Custom game implementation and tests; C++/Python implementations."},
+    {"url": "https://openspiel.readthedocs.io/en/latest/api_reference.html", "finding": "registered_names, load_game, information_state_string, chance_outcomes, apply_actions."},
+    {"url": "https://arxiv.org/pdf/1908.09453", "finding": "Framework paper algorithm table and CFR explanation, obtained through search excerpts. Full paper not claimed read."}
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "frozen_before_holdout": true,
+  "development_only_comparison": {
+    "baseline": {
+      "matches": 16,
+      "wins": 16,
+      "draws": 0,
+      "losses": 0,
+      "total_net": 4832,
+      "worst_net": 19
+    },
+    "experimental": {
+      "matches": 16,
+      "wins": 16,
+      "draws": 0,
+      "losses": 0,
+      "total_net": 4365,
+      "worst_net": 5
+    }
+  },
+  "files": {
+    "research/discard_holdem/adaptive.py": "ae4cfe4434caef11f43960a0a7e19ba47f2ec8f3cca0ebd0755f52213e371157",
+    "research/discard_holdem/partial_eval.py": "1ba2886b82f711f349d73dc0f70bf65c603a927ed79397f937e1903dde7594f5",
+    "tools/discard/redteam.py": "29e01307eb54fbc6e46ff759366e30d2e392140e6067e71a2f6dcbbdf83c4541",
+    "releases/discard/experimental/bot.py": "e133f9c2e740f3d9c28ec294515d3d52c7ac631ebe62a5f82d7fee0e6314e139",
+    "tests/discard/test_adaptive.py": "d9a743ebbd7fc623eb51ade4983b14e0fbf50261829df499f0b574d8a0b62b60"
+  }
+}

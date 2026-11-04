@@ -1,0 +1,192 @@
+{
+  "baseline": {
+    "matches": 32,
+    "wins": 32,
+    "draws": 0,
+    "losses": 0,
+    "total_net": 7232,
+    "worst_net": 12
+  },
+  "experimental": {
+    "matches": 32,
+    "wins": 32,
+    "draws": 0,
+    "losses": 0,
+    "total_net": 8598,
+    "worst_net": 7
+  },
+  "gates": {
+    "new_and_existing_discard_tests_pass": true,
+    "at_least_baseline_wins": true,
+    "higher_total_net": true,
+    "no_worse_worst_match": false,
+    "all_recorded_floors_preserved": true,
+    "all_protocol_ledgers_valid": true,
+    "frozen_source_identities": true
+  },
+  "eligible_for_next_validation_gate": false,
+  "promoted": false,
+  "champion": "releases/discard/v1/bot.py",
+  "explanation": "Experimental worst holdout net is7 versus baseline12; predeclared worst-result gate fails. Keep v1. Larger net is not perfect play.",
+  "supplied_engine_experimental_validation": "Not attempted: preceding strength gate failed; original v1 supplied-engine evidence remains valid.",
+  "paired_net_better": 18,
+  "paired_net_equal": 5,
+  "paired_net_worse": 9,
+  "profiles": [
+    {
+      "opponent": "CallingStation",
+      "baseline_nets": [
+        510,
+        576,
+        551,
+        532
+      ],
+      "experimental_nets": [
+        510,
+        576,
+        551,
+        532
+      ],
+      "baseline_total": 2169,
+      "experimental_total": 2169,
+      "baseline_capped_total": 1600,
+      "experimental_capped_total": 1600
+    },
+    {
+      "opponent": "CheckFold",
+      "baseline_nets": [
+        271,
+        250,
+        305,
+        262
+      ],
+      "experimental_nets": [
+        430,
+        423,
+        437,
+        411
+      ],
+      "baseline_total": 1088,
+      "experimental_total": 1701,
+      "baseline_capped_total": 1088,
+      "experimental_capped_total": 1600
+    },
+    {
+      "opponent": "Shove",
+      "baseline_nets": [
+        191,
+        158,
+        194,
+        172
+      ],
+      "experimental_nets": [
+        175,
+        158,
+        196,
+        195
+      ],
+      "baseline_total": 715,
+      "experimental_total": 724,
+      "baseline_capped_total": 715,
+      "experimental_capped_total": 724
+    },
+    {
+      "opponent": "Aggressor",
+      "baseline_nets": [
+        64,
+        201,
+        45,
+        40
+      ],
+      "experimental_nets": [
+        109,
+        157,
+        7,
+        78
+      ],
+      "baseline_total": 350,
+      "experimental_total": 351,
+      "baseline_capped_total": 350,
+      "experimental_capped_total": 351
+    },
+    {
+      "opponent": "ValueNit",
+      "baseline_nets": [
+        30,
+        538,
+        549,
+        189
+      ],
+      "experimental_nets": [
+        169,
+        121,
+        556,
+        537
+      ],
+      "baseline_total": 1306,
+      "experimental_total": 1383,
+      "baseline_capped_total": 1019,
+      "experimental_capped_total": 1090
+    },
+    {
+      "opponent": "Trap",
+      "baseline_nets": [
+        102,
+        281,
+        80,
+        466
+      ],
+      "experimental_nets": [
+        514,
+        487,
+        517,
+        165
+      ],
+      "baseline_total": 929,
+      "experimental_total": 1683,
+      "baseline_capped_total": 863,
+      "experimental_capped_total": 1365
+    },
+    {
+      "opponent": "SmallBall",
+      "baseline_nets": [
+        91,
+        12,
+        72,
+        184
+      ],
+      "experimental_nets": [
+        132,
+        121,
+        113,
+        12
+      ],
+      "baseline_total": 359,
+      "experimental_total": 378,
+      "baseline_capped_total": 359,
+      "experimental_capped_total": 378
+    },
+    {
+      "opponent": "Switch",
+      "baseline_nets": [
+        116,
+        62,
+        15,
+        123
+      ],
+      "experimental_nets": [
+        33,
+        42,
+        16,
+        118
+      ],
+      "baseline_total": 316,
+      "experimental_total": 209,
+      "baseline_capped_total": 316,
+      "experimental_capped_total": 209
+    }
+  ],
+  "baseline_capped_total": 6310,
+  "experimental_capped_total": 7317,
+  "scope": "fixed small local diagnostic holdout; not tournament odds, universal nonloss, minimax, or OS/runtime certification"
+}

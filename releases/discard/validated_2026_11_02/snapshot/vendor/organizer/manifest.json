@@ -1,0 +1,10 @@
+{
+  "source": "combined_files.md",
+  "source_sha256": "909d214fb2a580935ab8a87a3646a04e49424d504a47a0e4c7b946f81425206e",
+  "files": {
+    "bot.py": "61efb7b44b6fd7e292db6525c50a3971718f316adf7d2188e3d209b71788f80f",
+    "README.md": "20505e205573dee0f5ae7c79c4e1a1b8be8782d39ea0e22a92755baa66b9552a",
+    "engine.py": "7a44eb0ef7518e1343779d2a46163549e380b228d8f583f1d0478adf4fd64ad6",
+    "example_bots/random_bot.py": "48295442f56768f0a91c70f419eac0602114d7436bb64dc5813adbc5d6ad8461"
+  }
+}

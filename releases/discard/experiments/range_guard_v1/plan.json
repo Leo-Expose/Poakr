@@ -1,0 +1,19 @@
+{
+  "date": "2026-11-02",
+  "purpose": "Find failures, test one public-action adaptation without weakening existing proof gates",
+  "baseline": "releases/discard/v1/bot.py",
+  "baseline_sha256": "2de972289c37024c9283d8c29b273c694a2f229d67309ac347cfb7cfff7bb907",
+  "development_seeds": [301000, 301001],
+  "holdout_seeds": [401000, 401001, 401002, 401003],
+  "hands": 400,
+  "profiles": ["CallingStation", "CheckFold", "Shove", "Aggressor", "ValueNit", "Trap", "SmallBall", "Switch"],
+  "promotion_gates": [
+    "All existing tests and new physical-rank/proof-wrapper tests pass",
+    "Zero illegal replies, accounting errors or trust loss in every match",
+    "Exact original initial certified floor remains protected",
+    "Fresh holdout paired comparison, reporting all profiles, losses and worst result",
+    "At least baseline match wins, greater total net, and no worse worst match on holdout",
+    "Clock-enabled supplied engine and external raw resource timing if holdout gates pass"
+  ],
+  "limitations": "One development trial and fixed small holdout, not equilibrium, universal nonloss or tournament odds. Failed gates mean do not promote. Freeze original v1 and its attestation. No duplicate inference, hidden-card inputs, grace-window exploitation or runtime file/network/process access."
+}
