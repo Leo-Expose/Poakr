@@ -542,7 +542,7 @@ class Bot:
             elif b == 4:
                 if budget > 60:
                     q, pscore = self._turn_exact(board)
-                    exact_win = q >= 0.999
+                    exact_win = self._turn_q_unw >= 0.999
                 else:
                     q, pscore = self._equity_postflop(board, int((8000 if budget > 12 else 1000) * self.speed_scale),
                                                        weights=self._opp_action_weights)
@@ -656,7 +656,15 @@ class Bot:
         ofull = np.concatenate((np.tile(np.array(self.hole2, dtype=np.int64), (N, 1)), boards), axis=1)
         oscore = eval_batch(ofull)
         credit = (oscore > pscore) + 0.5 * (oscore == pscore)
-        return float(credit.mean()), pscore
+        q_unw = float(credit.mean())
+        self._turn_q_unw = q_unw
+        try:
+            w = self._opp_action_weights(pscore)
+        except Exception:
+            w = None
+        if w is not None and float(w.sum()) > 1e-9:
+            return float((w * credit).sum() / w.sum()), pscore
+        return q_unw, pscore
 
     def choose_discard(self, msg):
         self.tm.update(msg.get("time_left_ms", self.tm.last_left))
