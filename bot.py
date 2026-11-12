@@ -92,8 +92,8 @@ def _top_n(mask, n):
     return order.astype(np.int32)
 
 
-_SUBSETS = {w: np.array(list(combinations(range(w), 5)), dtype=np.int32) for w in (5, 6, 7)}
-_POW = (13 ** np.arange(4, -1, -1)).astype(np.int32)
+_SUBSETS = {w: np.array(list(combinations(range(w), 5))) for w in (5, 6, 7)}
+_POW = (13 ** np.arange(4, -1, -1)).astype(np.int64)
 _NONFLUSH = None
 _FLUSH = None
 
@@ -153,19 +153,19 @@ def eval_batch(cards):
     global _NONFLUSH, _FLUSH
     if _NONFLUSH is None:
         _build_eval_tables()
-    c = np.asarray(cards, dtype=np.int16)
+    c = np.asarray(cards, dtype=np.int64)
     if c.ndim != 2 or not 5 <= c.shape[1] <= 7:
         raise ValueError("cards must be (N,5..7)")
     N, W = c.shape
-    ranks = (c // 4).astype(np.int8)
-    suits = (c % 4).astype(np.int8)
+    ranks = c // 4
+    suits = c % 4
     order = np.argsort(ranks, axis=1, kind="stable")[:, ::-1]
     rs = np.take_along_axis(ranks, order, axis=1)
     ss = np.take_along_axis(suits, order, axis=1)
     subs = _SUBSETS[W]                       # (C(W,5), 5)
-    rc = rs[:, subs].astype(np.int32)
+    rc = rs[:, subs]                          # (N, S, 5), sorted desc
     sc = ss[:, subs]
-    key = np.dot(rc, _POW)
+    key = (rc * _POW).sum(axis=2)
     flush = (sc[..., 0] == sc[..., 1]) & (sc[..., 1] == sc[..., 2]) & (sc[..., 2] == sc[..., 3]) & (sc[..., 3] == sc[..., 4])
     v = np.where(flush, _FLUSH[key], _NONFLUSH[key])
     return v.max(axis=1).astype(np.int32)
@@ -384,41 +384,26 @@ class Bot:
         return float(credit.mean())
 
     def _flop_semiexact(self, board, R):
-        """All opponent pairs x R sampled runout pairs in memory-efficient chunks."""
+        """All opponent pairs x R sampled runout pairs. ~2*990*R evals."""
         own = self._own_cards()
         blocked = set(own) | set(board) | set(self.dead)
-        unseen = np.array([c for c in range(52) if c not in blocked], dtype=np.int16)
-        peers = np.array(list(combinations(unseen.tolist(), 2)), dtype=np.int16)
+        unseen = np.array([c for c in range(52) if c not in blocked], dtype=np.int64)
+        peers = np.array(list(combinations(unseen.tolist(), 2)), dtype=np.int64)
         P = len(peers)
-        b_np = np.array(board, dtype=np.int16)
-
-        chunk_size = 250
-        all_credits = []
-        all_pscores = []
-
-        for start in range(0, P, chunk_size):
-            chunk_peers = peers[start:start + chunk_size]
-            cP = len(chunk_peers)
-            draws = self._draw(unseen, cP * R, 2).astype(np.int16)
-            peer_rep = np.repeat(chunk_peers, R, axis=0)
-            boards = np.concatenate((np.tile(b_np, (cP * R, 1)), draws), axis=1)
-
-            pscore_chunk = eval_batch(np.concatenate((peer_rep, boards), axis=1))
-            if len(own) == 2:
-                oscore_chunk = eval_batch(np.concatenate((np.tile(np.array(own, dtype=np.int16), (cP * R, 1)), boards), axis=1))
-            else:
-                oscore_chunk = np.stack([
-                    eval_batch(np.concatenate((np.tile(np.array([own[i], own[j]], dtype=np.int16), (cP * R, 1)), boards), axis=1))
-                    for i, j in combinations(range(3), 2)
-                ]).max(axis=0)
-
-            credit_chunk = ((oscore_chunk > pscore_chunk) + 0.5 * (oscore_chunk == pscore_chunk)).reshape(cP, R).mean(axis=1)
-            all_credits.append(credit_chunk)
-            all_pscores.append(pscore_chunk.reshape(cP, R).mean(axis=1))
-
-        credit = np.concatenate(all_credits)
-        pscores = np.concatenate(all_pscores)
-        w = self._opp_action_weights(pscores)
+        draws = self._draw(unseen, P * R, 2)
+        runouts = draws  # (P*R, 2)
+        peer_rep = np.repeat(peers, R, axis=0)
+        boards = np.concatenate((np.tile(np.array(board, dtype=np.int64), (P * R, 1)), runouts), axis=1)
+        pscore = eval_batch(np.concatenate((peer_rep, boards), axis=1))
+        if len(own) == 2:
+            oscore = eval_batch(np.concatenate((np.tile(np.array(own, dtype=np.int64), (P * R, 1)), boards), axis=1))
+        else:
+            oscore = np.stack([
+                eval_batch(np.concatenate((np.tile(np.array([own[i], own[j]], dtype=np.int64), (P * R, 1)), boards), axis=1))
+                for i, j in combinations(range(3), 2)
+            ]).max(axis=0)
+        credit = ((oscore > pscore) + 0.5 * (oscore == pscore)).reshape(P, R).mean(axis=1)
+        w = self._opp_action_weights(pscore.reshape(P, R).mean(axis=1))
         if w is None:
             return float(credit.mean())
         return float((w * credit).sum() / max(1e-9, w.sum()))
@@ -805,50 +790,26 @@ class Bot:
         return {"type": "action", "action": "check"}
 
     def _turn_exact(self, board):
-        """Memory-efficient exact turn equity: evaluates all ~40k matchups in chunks
-        while pre-evaluating hero river scores to avoid redundant computation."""
+        """Exact turn equity: all opponent pairs x all legal rivers (~40k evals)."""
         blocked = set(self.hole2) | set(board) | set(self.dead)
-        unseen = np.array([c for c in range(52) if c not in blocked], dtype=np.int16)
+        unseen = np.array([c for c in range(52) if c not in blocked], dtype=np.int64)
         U = len(unseen)
-        peers = np.array(list(combinations(unseen.tolist(), 2)), dtype=np.int16)
+        peers = np.array(list(combinations(unseen.tolist(), 2)), dtype=np.int64)
         P = len(peers)
-        b_np = np.array(board, dtype=np.int16)
-
-        # Pre-evaluate hero score for all U rivers (only U=44 evals instead of 40,000!)
-        hero_full = np.column_stack((np.tile(self.hole2, (U, 1)), np.tile(b_np, (U, 1)), unseen))
-        hero_river_scores = eval_batch(hero_full)
-
-        chunk_size = 320
-        all_credits = []
-        all_pscores = []
-        all_peer_rep = []
-
-        for start in range(0, P, chunk_size):
-            chunk_peers = peers[start:start + chunk_size]
-            cP = len(chunk_peers)
-            pa = np.repeat(chunk_peers[:, 0], U)
-            pb = np.repeat(chunk_peers[:, 1], U)
-            r_all = np.tile(unseen, cP)
-            keep = (r_all != pa) & (r_all != pb)
-
-            p_rep = np.repeat(chunk_peers, U, axis=0)[keep]
-            r_rep = r_all[keep]
-
-            opp_full = np.column_stack((p_rep, np.tile(b_np, (len(r_rep), 1)), r_rep))
-            pscore_chunk = eval_batch(opp_full)
-
-            r_idx = np.tile(np.arange(U, dtype=np.int16), cP)[keep]
-            hscore_chunk = hero_river_scores[r_idx]
-
-            credit_chunk = (hscore_chunk > pscore_chunk) + 0.5 * (hscore_chunk == pscore_chunk)
-            all_credits.append(credit_chunk)
-            all_pscores.append(pscore_chunk)
-            all_peer_rep.append(p_rep)
-
-        credit = np.concatenate(all_credits)
-        pscore = np.concatenate(all_pscores)
-        peer_rep = np.concatenate(all_peer_rep)
-
+        # for each peer, rivers = unseen minus that peer's two cards
+        peer_a = np.repeat(peers[:, 0], U)
+        peer_b = np.repeat(peers[:, 1], U)
+        river_all = np.tile(unseen, P)
+        keep = (river_all != peer_a) & (river_all != peer_b)
+        peer_rep = np.repeat(peers, U, axis=0)[keep]
+        river_rep = river_all[keep]
+        N = len(river_rep)
+        boards = np.concatenate((np.tile(np.array(board, dtype=np.int64), (N, 1)),
+                                 river_rep[:, None]), axis=1)
+        pscore = eval_batch(np.concatenate((peer_rep, boards), axis=1))
+        ofull = np.concatenate((np.tile(np.array(self.hole2, dtype=np.int64), (N, 1)), boards), axis=1)
+        oscore = eval_batch(ofull)
+        credit = (oscore > pscore) + 0.5 * (oscore == pscore)
         q_unw = float(credit.mean())
         self._turn_q_unw = q_unw
         try:
