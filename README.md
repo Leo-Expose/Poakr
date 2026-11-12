@@ -3,7 +3,7 @@
 Python 3.11 bot for the Pokerbots Discard Hold'em tournament (heads-up Texas Hold'em, 3 hole cards, simultaneous exposed discard after the flop).
 
 **Submission:** `bot.py` (single file at the root of the submission, ~66 KB, standard library + NumPy only).  
-SHA-256: `155a1b52f5c264d531692298f25a6c5961b06adfd4e30ff6f4ec62284a8f9057`
+SHA-256: `097136a06391f455777d1c539ed6ebb7c997bc147310077b258bfb2c9efdee66`
 
 ---
 

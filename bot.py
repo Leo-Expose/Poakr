@@ -92,8 +92,8 @@ def _top_n(mask, n):
     return order.astype(np.int32)
 
 
-_SUBSETS = {w: np.array(list(combinations(range(w), 5))) for w in (5, 6, 7)}
-_POW = (13 ** np.arange(4, -1, -1)).astype(np.int64)
+_SUBSETS = {w: np.array(list(combinations(range(w), 5)), dtype=np.int32) for w in (5, 6, 7)}
+_POW = (13 ** np.arange(4, -1, -1)).astype(np.int32)
 _NONFLUSH = None
 _FLUSH = None
 
@@ -153,19 +153,19 @@ def eval_batch(cards):
     global _NONFLUSH, _FLUSH
     if _NONFLUSH is None:
         _build_eval_tables()
-    c = np.asarray(cards, dtype=np.int64)
+    c = np.asarray(cards, dtype=np.int16)
     if c.ndim != 2 or not 5 <= c.shape[1] <= 7:
         raise ValueError("cards must be (N,5..7)")
     N, W = c.shape
-    ranks = c // 4
-    suits = c % 4
+    ranks = (c // 4).astype(np.int8)
+    suits = (c % 4).astype(np.int8)
     order = np.argsort(ranks, axis=1, kind="stable")[:, ::-1]
     rs = np.take_along_axis(ranks, order, axis=1)
     ss = np.take_along_axis(suits, order, axis=1)
     subs = _SUBSETS[W]                       # (C(W,5), 5)
-    rc = rs[:, subs]                          # (N, S, 5), sorted desc
+    rc = rs[:, subs].astype(np.int32)        # (N, S, 5), sorted desc
     sc = ss[:, subs]
-    key = (rc * _POW).sum(axis=2)
+    key = np.dot(rc, _POW)
     flush = (sc[..., 0] == sc[..., 1]) & (sc[..., 1] == sc[..., 2]) & (sc[..., 2] == sc[..., 3]) & (sc[..., 3] == sc[..., 4])
     v = np.where(flush, _FLUSH[key], _NONFLUSH[key])
     return v.max(axis=1).astype(np.int32)
@@ -792,11 +792,15 @@ class Bot:
     def _turn_exact(self, board):
         """Exact turn equity: all opponent pairs x all legal rivers (~40k evals)."""
         blocked = set(self.hole2) | set(board) | set(self.dead)
-        unseen = np.array([c for c in range(52) if c not in blocked], dtype=np.int64)
+        unseen = np.array([c for c in range(52) if c not in blocked], dtype=np.int16)
         U = len(unseen)
-        peers = np.array(list(combinations(unseen.tolist(), 2)), dtype=np.int64)
+        peers = np.array(list(combinations(unseen.tolist(), 2)), dtype=np.int16)
         P = len(peers)
-        # for each peer, rivers = unseen minus that peer's two cards
+        b_np = np.array(board, dtype=np.int16)
+        # Pre-evaluate hero score for all U rivers (only U=44 evals instead of 40,000!)
+        hero_full = np.column_stack((np.tile(self.hole2, (U, 1)), np.tile(b_np, (U, 1)), unseen))
+        hero_river_scores = eval_batch(hero_full)
+
         peer_a = np.repeat(peers[:, 0], U)
         peer_b = np.repeat(peers[:, 1], U)
         river_all = np.tile(unseen, P)
@@ -804,11 +808,10 @@ class Bot:
         peer_rep = np.repeat(peers, U, axis=0)[keep]
         river_rep = river_all[keep]
         N = len(river_rep)
-        boards = np.concatenate((np.tile(np.array(board, dtype=np.int64), (N, 1)),
-                                 river_rep[:, None]), axis=1)
-        pscore = eval_batch(np.concatenate((peer_rep, boards), axis=1))
-        ofull = np.concatenate((np.tile(np.array(self.hole2, dtype=np.int64), (N, 1)), boards), axis=1)
-        oscore = eval_batch(ofull)
+        boards = np.column_stack((np.tile(b_np, (N, 1)), river_rep))
+        pscore = eval_batch(np.column_stack((peer_rep, boards)))
+        r_idx = np.tile(np.arange(U), P)[keep]
+        oscore = hero_river_scores[r_idx]
         credit = (oscore > pscore) + 0.5 * (oscore == pscore)
         q_unw = float(credit.mean())
         self._turn_q_unw = q_unw
