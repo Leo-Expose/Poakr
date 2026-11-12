@@ -92,8 +92,8 @@ def _top_n(mask, n):
     return order.astype(np.int32)
 
 
-_SUBSETS = {w: np.array(list(combinations(range(w), 5))) for w in (5, 6, 7)}
-_POW = (13 ** np.arange(4, -1, -1)).astype(np.int64)
+_SUBSETS = {w: np.array(list(combinations(range(w), 5)), dtype=np.int32) for w in (5, 6, 7)}
+_POW = (13 ** np.arange(4, -1, -1)).astype(np.int32)
 _NONFLUSH = None
 _FLUSH = None
 
@@ -153,19 +153,19 @@ def eval_batch(cards):
     global _NONFLUSH, _FLUSH
     if _NONFLUSH is None:
         _build_eval_tables()
-    c = np.asarray(cards, dtype=np.int64)
+    c = np.asarray(cards, dtype=np.int16)
     if c.ndim != 2 or not 5 <= c.shape[1] <= 7:
         raise ValueError("cards must be (N,5..7)")
     N, W = c.shape
-    ranks = c // 4
-    suits = c % 4
+    ranks = (c // 4).astype(np.int8)
+    suits = (c % 4).astype(np.int8)
     order = np.argsort(ranks, axis=1, kind="stable")[:, ::-1]
     rs = np.take_along_axis(ranks, order, axis=1)
     ss = np.take_along_axis(suits, order, axis=1)
     subs = _SUBSETS[W]                       # (C(W,5), 5)
-    rc = rs[:, subs]                          # (N, S, 5), sorted desc
+    rc = rs[:, subs].astype(np.int32)
     sc = ss[:, subs]
-    key = (rc * _POW).sum(axis=2)
+    key = np.dot(rc, _POW)
     flush = (sc[..., 0] == sc[..., 1]) & (sc[..., 1] == sc[..., 2]) & (sc[..., 2] == sc[..., 3]) & (sc[..., 3] == sc[..., 4])
     v = np.where(flush, _FLUSH[key], _NONFLUSH[key])
     return v.max(axis=1).astype(np.int32)
@@ -238,11 +238,23 @@ class Bot:
         self.dead = ()        # (my_discard, opp_discard)
         self.board = ()
         self.pre_equity = None  # cached preflop equity for this hand
-        # opponent model (per leg)
-        self.opp_stats = dict(hands=0, vpip=0, pfr=0, raises=0,
-                              folds=0, calls=0, checks=0, showdowns=0,
-                              fold_freq=0.5, agg=1.0,
-                              fb={"small": [0, 0], "mid": [0, 0], "big": [0, 0]})
+        self.flop_cards = ()
+        self.opp_d_card = None
+        self._opp_discard_weights = None
+        # Tournament meta-state: track cumulative net chips in this leg
+        self.leg_net = 0
+        # Opponent archetype classification (Nit, Station, Shover, Solver)
+        self.opp_archetype = "unknown"
+        # opponent model (per leg) with Beta priors for instantaneous adaptation
+        self.opp_stats = dict(
+            hands=0, vpip=0, pfr=0, raises=0,
+            folds=0, calls=0, checks=0, showdowns=0,
+            fold_freq=0.5, agg=1.0,
+            shove_count=0,
+            # Beta(alpha, beta) priors: fold_prior = Beta(2, 2) (mean 0.50)
+            fold_a=2.0, fold_b=2.0,
+            fb={"small": [2.0, 2.0], "mid": [2.0, 2.0], "big": [2.0, 2.0]}
+        )
         self.hand_actions = []  # opponent actions this hand
         self.speed_scale = 1.0   # default until init-time calibration
 
@@ -304,10 +316,13 @@ class Bot:
                 oscore = max(int(eval_batch(np.array([(own[i], own[j]) + tuple(board)], dtype=np.int64))[0])
                              for i, j in combinations(range(3), 2))
             credit = (oscore > pscore) + 0.5 * (oscore == pscore)
-            if weights is not None:
-                w = weights(pscore)
-                if w is not None:
-                    return float((w * credit).sum() / max(1e-9, w.sum())), pscore
+            w = weights(pscore) if weights is not None else np.ones(len(pscore), dtype=np.float64)
+            # incorporate Bayesian discard consistency
+            disc_w = self._opp_discard_consistency(peers)
+            if disc_w is not None:
+                w = (w if w is not None else 1.0) * disc_w
+            if w is not None:
+                return float((w * credit).sum() / max(1e-9, w.sum())), pscore
             return float(credit.mean()), pscore
         need = 5 - b
         draws = self._draw(unseen, S, 2 + need)  # opp pair + runout
@@ -318,10 +333,12 @@ class Bot:
         if len(own) == 2:
             oscore = eval_batch(np.concatenate((np.tile(np.array(own, dtype=np.int64), (S, 1)), boards), axis=1))
             credit = (oscore > pscore) + 0.5 * (oscore == pscore)
-            if weights is not None:
-                w = weights(pscore)
-                if w is not None:
-                    return float((w * credit).sum() / max(1e-9, w.sum())), pscore
+            w = weights(pscore) if weights is not None else np.ones(len(pscore), dtype=np.float64)
+            disc_w = self._opp_discard_consistency(opp2)
+            if disc_w is not None:
+                w = (w if w is not None else 1.0) * disc_w
+            if w is not None:
+                return float((w * credit).sum() / max(1e-9, w.sum())), pscore
             return float(credit.mean()), pscore
         # pre-discard: commit to ONE pair before seeing turn/river -> holding value
         # is max over pairs of each pair's MEAN equity (not per-runout max)
@@ -367,32 +384,69 @@ class Bot:
         return float(credit.mean())
 
     def _flop_semiexact(self, board, R):
-        """All opponent pairs x R sampled runout pairs. ~2*990*R evals."""
+        """All opponent pairs x R sampled runout pairs in memory-efficient chunks."""
         own = self._own_cards()
         blocked = set(own) | set(board) | set(self.dead)
-        unseen = np.array([c for c in range(52) if c not in blocked], dtype=np.int64)
-        peers = np.array(list(combinations(unseen.tolist(), 2)), dtype=np.int64)
+        unseen = np.array([c for c in range(52) if c not in blocked], dtype=np.int16)
+        peers = np.array(list(combinations(unseen.tolist(), 2)), dtype=np.int16)
         P = len(peers)
-        draws = self._draw(unseen, P * R, 2)
-        runouts = draws  # (P*R, 2)
-        peer_rep = np.repeat(peers, R, axis=0)
-        boards = np.concatenate((np.tile(np.array(board, dtype=np.int64), (P * R, 1)), runouts), axis=1)
-        pscore = eval_batch(np.concatenate((peer_rep, boards), axis=1))
-        if len(own) == 2:
-            oscore = eval_batch(np.concatenate((np.tile(np.array(own, dtype=np.int64), (P * R, 1)), boards), axis=1))
-        else:
-            oscore = np.stack([
-                eval_batch(np.concatenate((np.tile(np.array([own[i], own[j]], dtype=np.int64), (P * R, 1)), boards), axis=1))
-                for i, j in combinations(range(3), 2)
-            ]).max(axis=0)
-        credit = ((oscore > pscore) + 0.5 * (oscore == pscore)).reshape(P, R).mean(axis=1)
-        w = self._opp_action_weights(pscore.reshape(P, R).mean(axis=1))
+        b_np = np.array(board, dtype=np.int16)
+
+        chunk_size = 250
+        all_credits = []
+        all_pscores = []
+
+        for start in range(0, P, chunk_size):
+            chunk_peers = peers[start:start + chunk_size]
+            cP = len(chunk_peers)
+            draws = self._draw(unseen, cP * R, 2).astype(np.int16)
+            peer_rep = np.repeat(chunk_peers, R, axis=0)
+            boards = np.concatenate((np.tile(b_np, (cP * R, 1)), draws), axis=1)
+
+            pscore_chunk = eval_batch(np.concatenate((peer_rep, boards), axis=1))
+            if len(own) == 2:
+                oscore_chunk = eval_batch(np.concatenate((np.tile(np.array(own, dtype=np.int16), (cP * R, 1)), boards), axis=1))
+            else:
+                oscore_chunk = np.stack([
+                    eval_batch(np.concatenate((np.tile(np.array([own[i], own[j]], dtype=np.int16), (cP * R, 1)), boards), axis=1))
+                    for i, j in combinations(range(3), 2)
+                ]).max(axis=0)
+
+            credit_chunk = ((oscore_chunk > pscore_chunk) + 0.5 * (oscore_chunk == pscore_chunk)).reshape(cP, R).mean(axis=1)
+            all_credits.append(credit_chunk)
+            all_pscores.append(pscore_chunk.reshape(cP, R).mean(axis=1))
+
+        credit = np.concatenate(all_credits)
+        pscores = np.concatenate(all_pscores)
+        w = self._opp_action_weights(pscores)
         if w is None:
             return float(credit.mean())
         return float((w * credit).sum() / max(1e-9, w.sum()))
 
+    def _draw_potential_bonus(self, two, board):
+        """Bonus for hands with high nut-potential and implied odds (flush/straight draws)."""
+        ranks = [c // 4 for c in two]
+        suits = [c % 4 for c in two]
+        b_ranks = [c // 4 for c in board]
+        b_suits = [c % 4 for c in board]
+        bonus = 0.0
+        from collections import Counter
+        sc = Counter(b_suits)
+        for s, cnt in sc.items():
+            my_s = sum(1 for suit in suits if suit == s)
+            if cnt + my_s >= 4:
+                has_ace = any(c // 4 == 12 and c % 4 == s for c in two)
+                bonus += 0.08 if has_ace else 0.04
+        all_ranks = sorted(set(ranks + b_ranks))
+        for i in range(len(all_ranks) - 3):
+            if all_ranks[i+3] - all_ranks[i] == 3:
+                bonus += 0.04
+                break
+        return bonus
+
     def _discard_equity(self, board, S):
-        """For each of the 3 possible discards, estimate equity; return best discard card."""
+        """For each of the 3 possible discards, estimate equity + draw potential;
+        return best discard card with subtle mixed-discard camouflage for near-ties."""
         blocked = set(self.hole3) | set(board)
         unseen = np.array([c for c in range(52) if c not in blocked], dtype=np.int64)
         draws = self._draw(unseen, S, 3 + 2)  # opp 3 + turn+river
@@ -404,16 +458,39 @@ class Bot:
             eval_batch(np.concatenate((opp3[:, list(ix)], boards), axis=1))
             for ix in opp_pairs
         ]).max(axis=0)
-        best_d, best_e = None, -1.0
+        candidates = []
         for d in self.hole3:
             keep = tuple(c for c in self.hole3 if c != d)
             oscore = eval_batch(np.concatenate((np.tile(np.array(keep, dtype=np.int64), (S, 1)), boards), axis=1))
             e = float(((oscore > opp_best) + 0.5 * (oscore == opp_best)).mean())
-            if e > best_e:
-                best_e, best_d = e, d
+            draw_bonus = self._draw_potential_bonus(keep, board)
+            score = e + draw_bonus
+            candidates.append((score, d))
+        candidates.sort(key=lambda x: -x[0])
+        best_score, best_d = candidates[0]
+        # Discard camouflage: if 2nd candidate is within 0.015 of best, randomize 25% of the time
+        if len(candidates) > 1 and (best_score - candidates[1][0]) <= 0.015:
+            if self.rng.random() < 0.25:
+                return candidates[1][1]
         return best_d
 
     # ---------------- opponent modeling ----------------
+    def _opp_discard_consistency(self, opp_pairs):
+        """Vectorized consistency of opponent candidate pairs with their exposed discard."""
+        if not self.flop_cards or self.opp_d_card is None:
+            return None
+        opp_d = self.opp_d_card
+        N = len(opp_pairs)
+        b_tile = np.tile(np.array(self.flop_cards, dtype=np.int64), (N, 1))
+        s_keep = eval_batch(np.column_stack((opp_pairs, b_tile)))
+        s_alt1 = eval_batch(np.column_stack((opp_pairs[:, 0], np.full(N, opp_d, dtype=np.int64), b_tile)))
+        s_alt2 = eval_batch(np.column_stack((opp_pairs[:, 1], np.full(N, opp_d, dtype=np.int64), b_tile)))
+        best_alt = np.maximum(s_alt1, s_alt2)
+        diff = s_keep.astype(np.int64) - best_alt.astype(np.int64)
+        # s_keep > best_alt: consistent (1.0). Equal: 0.7. Inferior: decays smoothly.
+        w = np.where(diff > 0, 1.0, np.where(diff == 0, 0.7, np.exp(np.clip(diff / 60000.0, -10.0, 0.0)) * 0.15))
+        return w
+
     def _opp_action_weights(self, pscore):
         """Likelihood weights for opponent holdings given their actions this hand
         and their historical tendencies. pscore: showdown scores of sampled holdings."""
@@ -459,7 +536,8 @@ class Bot:
                 elif a == "call":
                     st["calls"] += 1
                     bucket = "small" if last_my_raise <= 8 else ("mid" if last_my_raise <= 30 else "big")
-                    st["fb"][bucket][1] += 1
+                    st["fb"][bucket][1] += 1.0
+                    st["fold_b"] += 1.0
                     if ev.get("street") == "preflop":
                         saw_bet = True
                 elif a == "check":
@@ -467,25 +545,37 @@ class Bot:
                 elif a == "fold":
                     st["folds"] += 1
                     bucket = "small" if last_my_raise <= 8 else ("mid" if last_my_raise <= 30 else "big")
-                    st["fb"][bucket][0] += 1
+                    st["fb"][bucket][0] += 1.0
+                    st["fold_a"] += 1.0
         if saw_bet:
             st["vpip"] += 1
         if any(isinstance(ev, dict) and ev.get("actor") == "opp" and ev.get("action") == "raise"
                and ev.get("street") == "preflop" for ev in history):
             st["pfr"] += 1
-        st["fold_freq"] = st["folds"] / max(1, st["folds"] + st["calls"])
+        st["fold_freq"] = st["fold_a"] / (st["fold_a"] + st["fold_b"])
         st["agg"] = (st["raises"] + 0.5) / max(1, st["raises"] + st["calls"])
         if result == "showdown":
             st["showdowns"] += 1
 
+        # Classify opponent archetype once we have 8+ hands
+        h = st["hands"]
+        if h >= 8:
+            v_rate = st["vpip"] / h
+            ff = st["fold_freq"]
+            if st["shove_count"] >= 3:
+                self.opp_archetype = "shover"
+            elif ff >= 0.65 and v_rate < 0.45:
+                self.opp_archetype = "nit"
+            elif ff <= 0.35 and v_rate >= 0.55:
+                self.opp_archetype = "station"
+            else:
+                self.opp_archetype = "balanced"
+
     def _fold_freq_for(self, size_to):
-        """Estimated P(opp folds) to a bet of street-total size_to, by size bucket.
-        Falls back to the global fold frequency until we have enough data."""
+        """Estimated P(opp folds) to a bet of street-total size_to, by size bucket via Beta posterior."""
         bucket = "small" if size_to <= 8 else ("mid" if size_to <= 30 else "big")
-        f, c = self.opp_stats["fb"][bucket]
-        if f + c < 8 or self.opp_stats["hands"] < 25:
-            return self.opp_stats["fold_freq"] if self.opp_stats["hands"] >= 10 else 0.5
-        return f / (f + c)
+        a, b = self.opp_stats["fb"][bucket]
+        return a / (a + b)
 
     # ---------------- decision ----------------
     def _size_to(self, msg, frac):
@@ -568,15 +658,27 @@ class Bot:
             fold_freq = 0.5
         blocker = self._blocker_bonus(board)
 
+        # ---- endgame match-point shield ----
+        # If safely ahead late in the leg (> +150 chips, final 25% of hands), avoid high-variance coin flips
+        hands_left = max(1, self.total - self.hand_id + 1)
+        shield_mode = (self.leg_net >= 150) and (hands_left <= 0.25 * self.total)
+
         # ---- guaranteed-win shove ----
         if exact_win and can_raise and mx >= msg.get("min_raise", 0):
             return {"type": "action", "action": "raise", "amount": mx}
 
         # adaptive value-raise threshold: lower vs calling stations, higher vs nits
-        # (only trust the adaptation once we have a decent sample of the opponent)
         caller = 1.0 - fold_freq
         adapt = 0.06 if self.opp_stats["hands"] >= 25 else 0.02
         vthr = 0.78 - adapt * caller
+        # Archetype adjustments
+        if self.opp_archetype == "station":
+            vthr -= 0.05
+        elif self.opp_archetype == "nit":
+            vthr += 0.04
+        if shield_mode:
+            vthr += 0.05  # tighten value-raises when locking in match point
+
         # position adjustment: tighter when out of position preflop
         pos_adj = 0.04 if (self.seat == "big_blind" and street == "preflop") else 0.0
 
@@ -589,77 +691,171 @@ class Bot:
         # ---- facing a bet ----
         if owed > 0:
             big_bet = owed >= 0.5 * pot
-            # preflop cheap completion (button vs big blind): raise a wide range
-            if street == "preflop" and owed <= 2 and can_raise and raises_left > 0 and q > 0.55:
-                return {"type": "action", "action": "raise", "amount": self._size_to(msg, 0.6)}
-            # value raise only with a genuinely strong hand
+            # Shover Killer: snap-call with any reasonable positive expectation (> 48%)
+            if self.opp_archetype == "shover":
+                if q >= 0.48:
+                    return {"type": "action", "action": "call"}
+                return {"type": "action", "action": "fold"}
+
+            # preflop cheap completion: Button completes or raises wide; Big Blind defends wide
+            if street == "preflop" and owed <= 2 and can_raise and raises_left > 0:
+                is_button = (self.seat == "button")
+                if is_button:
+                    # Button facing BB option check or min-raise: raise wide with q > 0.45
+                    if q > 0.45:
+                        return {"type": "action", "action": "raise", "amount": self._size_to(msg, 0.5)}
+                    elif q >= 0.35:
+                        return {"type": "action", "action": "call"}
+                else:
+                    # Big Blind facing Button opening raise of 2 to 4 (owed = 2): defend wide!
+                    if q > 0.62:
+                        return {"type": "action", "action": "raise", "amount": self._size_to(msg, 0.9)} # 3-bet
+                    elif q >= 0.38:
+                        return {"type": "action", "action": "call"} # defend BB flat
+
+            # Value raise using real Fold-Equity expectation
             if can_raise and raises_left > 0 and q > vthr:
                 frac = (1.1 if q > 0.9 else (0.75 if q > 0.85 else 0.5)) * (0.8 + 0.4 * caller)
-                return {"type": "action", "action": "raise", "amount": self._size_to(msg, min(frac, 1.5))}
-            # bluff raise: pick the size bucket where the opponent folds most
-            if can_raise and q < 0.30 and raises_left > 1 and pot <= 80:
-                best_frac, best_ff = 0.6, -1.0
-                for fr in (0.4, 0.6, 0.9):
-                    amt = self._size_to(msg, fr)
-                    ff = self._fold_freq_for(amt)
-                    if ff > best_ff:
-                        best_ff, best_frac = ff, fr
-                amt = self._size_to(msg, best_frac)
-                indiff = amt / (pot + amt)
-                bluff_p = 0.12 + 0.35 * max(0.0, best_ff - indiff) + blocker
-                if self.rng.random() < min(0.5, bluff_p):
-                    return {"type": "action", "action": "raise", "amount": amt}
-            need = price + (0.10 if big_bet else 0.02) + pos_adj
-            if q >= need and not (big_bet and q < 0.55):
-                return {"type": "action", "action": "call"}
-            return {"type": "action", "action": "fold"}
+                amt = self._size_to(msg, min(frac, 1.5))
+                return {"type": "action", "action": "raise", "amount": amt}
 
-        # ---- no bet facing us ----
-        if can_raise and raises_left > 0:
-            is_button = self.seat == "button"
-            open_thr = 0.56 if (is_button and street == "preflop") else 0.62
-            if q > open_thr:
-                # value size: bigger vs callers, but pick the bucket they call most
-                base_frac = 1.0 if q > 0.85 else (0.7 if q > 0.75 else 0.5)
-                frac = min(1.4, base_frac * (0.8 + 0.5 * caller))
-                return {"type": "action", "action": "raise", "amount": self._size_to(msg, frac)}
-            if q < 0.35:
+            # Bluff raise: disabled vs calling stations or in shield mode
+            can_bluff = (self.opp_archetype != "station") and (not shield_mode)
+            if can_bluff and can_raise and q < 0.28 and raises_left > 1 and pot <= 60 and street != "river":
                 best_frac, best_ff = 0.55, -1.0
                 for fr in (0.4, 0.55, 0.8):
                     amt = self._size_to(msg, fr)
                     ff = self._fold_freq_for(amt)
                     if ff > best_ff:
                         best_ff, best_frac = ff, fr
-                bluff_p = 0.10 + 0.30 * max(0.0, best_ff - 0.45) + blocker
-                if self.rng.random() < min(0.45, bluff_p):
-                    return {"type": "action", "action": "raise", "amount": self._size_to(msg, best_frac)}
+                amt = self._size_to(msg, best_frac)
+                indiff = amt / (pot + amt)
+                bluff_p = 0.08 + 0.30 * max(0.0, best_ff - indiff) + blocker
+                if self.rng.random() < min(0.35, bluff_p):
+                    return {"type": "action", "action": "raise", "amount": amt}
+
+            # River GTO Minimum Defense Frequency (MDF) Bluff-Catcher Guard
+            if street == "river":
+                call_margin = 0.04 if shield_mode else 0.01
+                if q >= (price + call_margin):
+                    return {"type": "action", "action": "call"}
+                return {"type": "action", "action": "fold"}
+
+            need = price + (0.10 if big_bet else 0.02) + pos_adj + (0.04 if shield_mode else 0.0)
+            if q >= need and not (big_bet and q < 0.52):
+                return {"type": "action", "action": "call"}
+            return {"type": "action", "action": "fold"}
+
+        # ---- no bet facing us ----
+        if can_raise and raises_left > 0:
+            is_button = self.seat == "button"
+            # Optimal HU Preflop Opening Frequency:
+            # Button opens ~85% of hands (min-raise to 4) because position gives massive EV advantage
+            if street == "preflop" and is_button:
+                open_thr = 0.44 if self.opp_archetype != "shover" else 0.50
+                if q >= open_thr:
+                    return {"type": "action", "action": "raise", "amount": max(msg["min_raise"], 4)}
+                return {"type": "action", "action": "check"}
+
+            # Flop Continuation-Bet (C-Bet) Texture Analysis:
+            if street == "flop" and len(board) == 3:
+                ranks = sorted([c // 4 for c in board])
+                suits = [c % 4 for c in board]
+                is_dry = (len(set(suits)) == 3 and (ranks[2] - ranks[0] >= 5)) or (len(set(ranks)) < 3)
+                # Dry board: high-frequency small c-bet (30% pot)
+                if is_dry and (q > 0.48 or self.rng.random() < 0.35) and not shield_mode:
+                    amt = self._size_to(msg, 0.33)
+                    return {"type": "action", "action": "raise", "amount": amt}
+                # Wet board: value/draw c-bet (60% pot)
+                if q > 0.65:
+                    amt = self._size_to(msg, 0.60)
+                    return {"type": "action", "action": "raise", "amount": amt}
+
+            open_thr = 0.56 if (is_button and street == "preflop") else 0.61
+            if self.opp_archetype == "nit":
+                open_thr -= 0.05  # exploit nits with aggressive steals
+            if q > open_thr:
+                # Value sizing: against fish/stations and nits, extract maximum chips
+                # If monster (q > 0.88), bet big to accelerate toward +400/+1000 cap!
+                if q > 0.88 and not shield_mode:
+                    base_frac = 1.3
+                elif q > 0.80:
+                    base_frac = 1.0
+                elif q > 0.70:
+                    base_frac = 0.75
+                else:
+                    base_frac = 0.55
+                frac = min(1.5, base_frac * (0.8 + 0.5 * caller))
+                if self.opp_archetype == "station":
+                    frac = min(1.6, frac * 1.3)  # aggressive value extraction vs stations
+                return {"type": "action", "action": "raise", "amount": self._size_to(msg, frac)}
+            can_bluff = (self.opp_archetype != "station") and (not shield_mode)
+            if can_bluff and q < 0.30 and street != "river":
+                best_frac, best_ff = 0.55, -1.0
+                for fr in (0.4, 0.55, 0.8):
+                    amt = self._size_to(msg, fr)
+                    ff = self._fold_freq_for(amt)
+                    if ff > best_ff:
+                        best_ff, best_frac = ff, fr
+                amt = self._size_to(msg, best_frac)
+                indiff = amt / (pot + amt)
+                bluff_p = 0.08 + 0.25 * max(0.0, best_ff - indiff) + blocker
+                if self.rng.random() < min(0.35, bluff_p):
+                    return {"type": "action", "action": "raise", "amount": amt}
         return {"type": "action", "action": "check"}
 
     def _turn_exact(self, board):
-        """Exact turn equity: all opponent pairs x all legal rivers (~40k evals)."""
+        """Memory-efficient exact turn equity: evaluates all ~40k matchups in chunks
+        while pre-evaluating hero river scores to avoid redundant computation."""
         blocked = set(self.hole2) | set(board) | set(self.dead)
-        unseen = np.array([c for c in range(52) if c not in blocked], dtype=np.int64)
+        unseen = np.array([c for c in range(52) if c not in blocked], dtype=np.int16)
         U = len(unseen)
-        peers = np.array(list(combinations(unseen.tolist(), 2)), dtype=np.int64)
+        peers = np.array(list(combinations(unseen.tolist(), 2)), dtype=np.int16)
         P = len(peers)
-        # for each peer, rivers = unseen minus that peer's two cards
-        peer_a = np.repeat(peers[:, 0], U)
-        peer_b = np.repeat(peers[:, 1], U)
-        river_all = np.tile(unseen, P)
-        keep = (river_all != peer_a) & (river_all != peer_b)
-        peer_rep = np.repeat(peers, U, axis=0)[keep]
-        river_rep = river_all[keep]
-        N = len(river_rep)
-        boards = np.concatenate((np.tile(np.array(board, dtype=np.int64), (N, 1)),
-                                 river_rep[:, None]), axis=1)
-        pscore = eval_batch(np.concatenate((peer_rep, boards), axis=1))
-        ofull = np.concatenate((np.tile(np.array(self.hole2, dtype=np.int64), (N, 1)), boards), axis=1)
-        oscore = eval_batch(ofull)
-        credit = (oscore > pscore) + 0.5 * (oscore == pscore)
+        b_np = np.array(board, dtype=np.int16)
+
+        # Pre-evaluate hero score for all U rivers (only U=44 evals instead of 40,000!)
+        hero_full = np.column_stack((np.tile(self.hole2, (U, 1)), np.tile(b_np, (U, 1)), unseen))
+        hero_river_scores = eval_batch(hero_full)
+
+        chunk_size = 320
+        all_credits = []
+        all_pscores = []
+        all_peer_rep = []
+
+        for start in range(0, P, chunk_size):
+            chunk_peers = peers[start:start + chunk_size]
+            cP = len(chunk_peers)
+            pa = np.repeat(chunk_peers[:, 0], U)
+            pb = np.repeat(chunk_peers[:, 1], U)
+            r_all = np.tile(unseen, cP)
+            keep = (r_all != pa) & (r_all != pb)
+
+            p_rep = np.repeat(chunk_peers, U, axis=0)[keep]
+            r_rep = r_all[keep]
+
+            opp_full = np.column_stack((p_rep, np.tile(b_np, (len(r_rep), 1)), r_rep))
+            pscore_chunk = eval_batch(opp_full)
+
+            r_idx = np.tile(np.arange(U, dtype=np.int16), cP)[keep]
+            hscore_chunk = hero_river_scores[r_idx]
+
+            credit_chunk = (hscore_chunk > pscore_chunk) + 0.5 * (hscore_chunk == pscore_chunk)
+            all_credits.append(credit_chunk)
+            all_pscores.append(pscore_chunk)
+            all_peer_rep.append(p_rep)
+
+        credit = np.concatenate(all_credits)
+        pscore = np.concatenate(all_pscores)
+        peer_rep = np.concatenate(all_peer_rep)
+
         q_unw = float(credit.mean())
         self._turn_q_unw = q_unw
         try:
             w = self._opp_action_weights(pscore)
+            disc_w = self._opp_discard_consistency(peer_rep)
+            if disc_w is not None:
+                w = (w if w is not None else 1.0) * disc_w
         except Exception:
             w = None
         if w is not None and float(w.sum()) > 1e-9:
@@ -673,6 +869,7 @@ class Bot:
         if self.tm.last_left < 0.18 * self.tm.bank:
             budget = 2.0
         board = parse_cards(msg["board"], 3)
+        self.flop_cards = board
         hole = parse_cards(msg["hole_cards"], 3)
         self.hole3 = hole
         if budget < 10:
@@ -725,6 +922,9 @@ class Bot:
             self.dead = ()
             self.board = ()
             self.pre_equity = None
+            self.flop_cards = ()
+            self.opp_d_card = None
+            self._opp_discard_weights = None
             self.hand_actions = []
             return None
         if t == "discard_request":
@@ -732,6 +932,7 @@ class Bot:
         if t == "discard_result":
             self.hole2 = parse_cards(msg.get("hole_cards", []), 2)
             self.dead = (card(msg.get("my_discard")), card(msg.get("opp_discard")))
+            self.opp_d_card = card(msg.get("opp_discard"))
             return None
         if t == "action_request":
             # rebuild opponent action list fresh from this request's history
@@ -750,6 +951,7 @@ class Bot:
                 return self.safe_action(msg)
         if t == "hand_result":
             try:
+                self.leg_net += int(msg.get("net", 0))
                 self._update_stats(msg.get("history", []), msg.get("result"),
                                    msg.get("opp_hole_cards"), msg.get("opp_discard"))
             except Exception:
